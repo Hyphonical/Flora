@@ -61,35 +61,31 @@ options! {
 	("version", Some('V'), false, Some("false"), "Show version", "all"),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OutputFlags {
 	pub quiet: bool,
 	pub no_color: bool,
 }
 
 impl OutputFlags {
-	pub(crate) fn from_process() -> Self {
-		let mut quiet = parse_bool_lenient(std::env::var("FLORA_QUIET").ok().as_deref());
-		let mut no_color = parse_bool_lenient(std::env::var("FLORA_NO_COLOR").ok().as_deref());
-		let mut positional_only = false;
-		for arg in std::env::args().skip(1) {
-			if !positional_only && arg == "--" {
-				positional_only = true;
-				continue;
+	pub(crate) fn from_env() -> Self {
+		Self::from_env_with(|key| std::env::var(key))
+	}
+
+	fn from_env_with(
+		env_lookup: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
+	) -> Self {
+		let quiet = env_lookup("FLORA_QUIET")
+			.ok()
+			.and_then(|v| parse_bool("quiet", &v).ok())
+			.unwrap_or(false);
+		let no_color = match env_lookup("FLORA_NO_COLOR") {
+			Ok(v) => parse_bool("no-color", &v).unwrap_or(false),
+			Err(_) => {
+				env_lookup("NO_COLOR").is_ok_and(|v| !v.is_empty())
+					|| env_lookup("TERM").is_ok_and(|t| t == "dumb")
 			}
-			if positional_only {
-				continue;
-			}
-			if arg == "-q" || arg == "--quiet" {
-				quiet = true;
-			} else if let Some(val) = arg.strip_prefix("--quiet=") {
-				quiet = parse_bool_lenient(Some(val));
-			} else if arg == "--no-color" {
-				no_color = true;
-			} else if let Some(val) = arg.strip_prefix("--no-color=") {
-				no_color = parse_bool_lenient(Some(val));
-			}
-		}
+		};
 		Self { quiet, no_color }
 	}
 }
@@ -190,18 +186,32 @@ impl Config {
 		OutputFlags { quiet: self.global.quiet, no_color: self.global.no_color }
 	}
 
-	pub(crate) fn parse() -> Result<Self> {
-		Self::parse_from(std::env::args().skip(1), |env| std::env::var(env))
+	pub(crate) fn parse(early: &mut OutputFlags) -> Result<Self> {
+		Self::parse_from(std::env::args().skip(1), |env| std::env::var(env), early)
 	}
 
 	fn parse_from(
 		mut args: impl Iterator<Item = String>,
 		env_lookup: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
+		early: &mut OutputFlags,
 	) -> Result<Self> {
+		*early = OutputFlags::from_env_with(&env_lookup);
 		let mut cli_flags: HashMap<&'static str, String> = HashMap::new();
 		let mut command: Option<String> = None;
 		let mut positionals = Vec::new();
 		let mut positional_only = false;
+
+		let mut record_early = |name: &'static str, value: &str| {
+			if name == "quiet"
+				&& let Ok(b) = parse_bool(name, value)
+			{
+				early.quiet = b;
+			} else if name == "no-color"
+				&& let Ok(b) = parse_bool(name, value)
+			{
+				early.no_color = b;
+			}
+		};
 
 		while let Some(arg) = args.next() {
 			if !positional_only && arg == "--" {
@@ -209,7 +219,7 @@ impl Config {
 				continue;
 			}
 			if !positional_only && arg.starts_with('-') && arg != "-" {
-				let (spec, inline) = if let Some(long) = arg.strip_prefix("--") {
+				if let Some(long) = arg.strip_prefix("--") {
 					let (key, inline) = match long.split_once('=') {
 						Some((name, value)) => (name, Some(value)),
 						None => (long, None),
@@ -218,40 +228,38 @@ impl Config {
 						.iter()
 						.find(|s| s.name == key)
 						.with_context(|| format!("unknown option --{key}"))?;
-					(spec, inline)
+					let value = resolve_option_value(spec, inline, &mut args)?;
+					record_early(spec.name, &value);
+					cli_flags.insert(spec.name, value);
 				} else {
 					let rest = &arg[1..];
-					let mut chars = rest.chars();
-					let ch = chars.next().context("empty option")?;
-					let spec = OPTIONS
-						.iter()
-						.find(|s| s.alias == Some(ch))
-						.with_context(|| format!("unknown option -{ch}"))?;
-					let tail = &rest[ch.len_utf8()..];
-					let inline = if tail.is_empty() {
-						None
-					} else if spec.value {
-						Some(tail.strip_prefix('=').unwrap_or(tail))
-					} else {
-						bail!("unknown option {arg}");
-					};
-					(spec, inline)
-				};
-				let value = if spec.value {
-					inline
-						.map(str::to_owned)
-						.or_else(|| args.next())
-						.with_context(|| format!("--{} requires a value", spec.name))?
-				} else {
-					match inline {
-						None => "true".to_owned(),
-						Some(v) => {
-							parse_bool(spec.name, v)?;
-							v.to_owned()
+					if rest.is_empty() {
+						bail!("empty option");
+					}
+					for (idx, ch) in rest.char_indices() {
+						let spec = OPTIONS
+							.iter()
+							.find(|s| s.alias == Some(ch))
+							.with_context(|| format!("unknown option -{ch}"))?;
+						let tail = &rest[idx + ch.len_utf8()..];
+						if spec.value {
+							let inline =
+								(!tail.is_empty()).then(|| tail.strip_prefix('=').unwrap_or(tail));
+							let value = resolve_option_value(spec, inline, &mut args)?;
+							record_early(spec.name, &value);
+							cli_flags.insert(spec.name, value);
+							break;
+						} else if let Some(inline) = tail.strip_prefix('=') {
+							let value = resolve_option_value(spec, Some(inline), &mut args)?;
+							record_early(spec.name, &value);
+							cli_flags.insert(spec.name, value);
+							break;
+						} else {
+							record_early(spec.name, "true");
+							cli_flags.insert(spec.name, "true".to_owned());
 						}
 					}
-				};
-				cli_flags.insert(spec.name, value);
+				}
 			} else if command.is_none() {
 				command = Some(arg);
 			} else {
@@ -267,8 +275,7 @@ impl Config {
 			match env_lookup(&env) {
 				Ok(value) => Ok(Some(value)),
 				Err(std::env::VarError::NotPresent) => {
-					let default =
-						OPTIONS.iter().find(|s| s.name == name).and_then(|s| s.default);
+					let default = OPTIONS.iter().find(|s| s.name == name).and_then(|s| s.default);
 					Ok(default.map(str::to_owned))
 				}
 				Err(error) => Err(error).with_context(|| format!("reading {env}")),
@@ -282,7 +289,14 @@ impl Config {
 		let help = boolean("help")?;
 		let version = boolean("version")?;
 		let quiet = boolean("quiet")?;
-		let no_color = boolean("no-color")?;
+		let no_color = if cli_flags.contains_key("no-color") || env_lookup("FLORA_NO_COLOR").is_ok()
+		{
+			boolean("no-color")?
+		} else {
+			early.no_color
+		};
+		early.quiet = quiet;
+		early.no_color = no_color;
 		let log = required("log")?;
 
 		if version {
@@ -325,7 +339,8 @@ impl Config {
 			}
 		}
 
-		let server = if canonical == "serve" || canonical == "login" { None } else { lookup("server")? };
+		let server =
+			if canonical == "serve" || canonical == "login" { None } else { lookup("server")? };
 		let token = if canonical == "serve" { None } else { lookup("token")? };
 		let global = GlobalOptions { log, server, token, quiet, no_color };
 
@@ -364,7 +379,12 @@ impl Config {
 				let target = positional(&positionals, 0, &usage)?;
 				let parallel = parse_parallel(&required("parallel")?)?;
 				let label = if cmd == "down" { "down" } else { "download" };
-				Command::Download(DownloadConfig { label, target, output: lookup("output")?, parallel })
+				Command::Download(DownloadConfig {
+					label,
+					target,
+					output: lookup("output")?,
+					parallel,
+				})
 			}
 			"cat" => {
 				ensure_max_positionals(&positionals, 1, "flora cat <path|url>")?;
@@ -411,7 +431,8 @@ fn parse_serve(
 	if upload_concurrency == 0 || upload_concurrency > tokio::sync::Semaphore::MAX_PERMITS {
 		bail!("--upload-concurrency must be positive and within the semaphore limit");
 	}
-	let buffer_size: ByteSize = required("buffer-size")?.parse().context("invalid --buffer-size")?;
+	let buffer_size: ByteSize =
+		required("buffer-size")?.parse().context("invalid --buffer-size")?;
 	let disk_limit = lookup("disk-limit")?
 		.map(|limit| limit.parse::<ByteSize>().context("invalid --disk-limit"))
 		.transpose()?;
@@ -477,11 +498,26 @@ fn parse_bool(name: &str, raw: &str) -> Result<bool> {
 		_ => bail!("--{name} must be true or false"),
 	}
 }
-
-fn parse_bool_lenient(raw: Option<&str>) -> bool {
-	raw.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+fn resolve_option_value(
+	spec: &OptionSpec,
+	inline: Option<&str>,
+	args: &mut impl Iterator<Item = String>,
+) -> Result<String> {
+	if spec.value {
+		inline
+			.map(str::to_owned)
+			.or_else(|| args.next())
+			.with_context(|| format!("--{} requires a value", spec.name))
+	} else {
+		match inline {
+			None => Ok("true".to_owned()),
+			Some(v) => {
+				parse_bool(spec.name, v)?;
+				Ok(v.to_owned())
+			}
+		}
+	}
 }
-
 fn positional(positionals: &[String], index: usize, usage: &str) -> Result<String> {
 	positionals.get(index).cloned().with_context(|| format!("usage: {usage}"))
 }
@@ -498,9 +534,12 @@ mod tests {
 	use super::*;
 
 	fn parse(args: &[&str]) -> Result<Config> {
-		Config::parse_from(args.iter().map(|s| (*s).to_owned()), |_| {
-			Err(std::env::VarError::NotPresent)
-		})
+		let mut early = OutputFlags::default();
+		Config::parse_from(
+			args.iter().map(|s| (*s).to_owned()),
+			|_| Err(std::env::VarError::NotPresent),
+			&mut early,
+		)
 	}
 
 	#[test]
@@ -567,5 +606,43 @@ mod tests {
 		let err_down =
 			parse(&["download", "a.txt", "--on-conflict", "replace"]).err().expect("reject flag");
 		assert!(err_down.to_string().contains("not valid for 'flora download'"));
+	}
+
+	#[test]
+	fn no_color_env_and_bundled_short_flags_work() {
+		let mut early = OutputFlags::default();
+		let cfg = Config::parse_from(
+			["ls"].into_iter().map(str::to_owned),
+			|k| {
+				if k == "NO_COLOR" {
+					Ok("1".to_owned())
+				} else {
+					Err(std::env::VarError::NotPresent)
+				}
+			},
+			&mut early,
+		)
+		.expect("parse with NO_COLOR");
+		assert!(cfg.global.no_color);
+		assert!(early.no_color);
+
+		let mut early_override = OutputFlags::default();
+		let cfg_override = Config::parse_from(
+			["ls", "--no-color=false"].into_iter().map(str::to_owned),
+			|k| {
+				if k == "NO_COLOR" {
+					Ok("1".to_owned())
+				} else {
+					Err(std::env::VarError::NotPresent)
+				}
+			},
+			&mut early_override,
+		)
+		.expect("override NO_COLOR");
+		assert!(!cfg_override.global.no_color);
+
+		let bundled = parse(&["ls", "-qh"]).expect("bundled -qh");
+		assert!(bundled.global.quiet);
+		assert!(matches!(&bundled.action, Command::Help(Some(c)) if c == "ls"));
 	}
 }

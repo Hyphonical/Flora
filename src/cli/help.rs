@@ -1,11 +1,11 @@
 //! Help and version presentation built from the parser's option definitions.
 
 use super::{
-	render::{self, blank, column, line, rule},
-	style::Color,
+	render::{clean, column},
+	style::{self, Color},
 };
 use crate::core::config::{OPTIONS, OptionSpec, OutputFlags, canonical_command};
-
+use std::io::IsTerminal;
 fn usage(command: &str) -> &'static str {
 	match command {
 		"serve" => "flora serve [options]",
@@ -22,9 +22,40 @@ fn usage(command: &str) -> &'static str {
 	}
 }
 
-fn group(flags: OutputFlags, title: &str, description: &str) {
-	blank(flags);
-	line(flags, &format!("{title} — {description}"), Color::Heading);
+fn stdout_interactive() -> bool {
+	std::io::stdout().is_terminal() && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
+}
+
+fn stdout_colored(flags: OutputFlags) -> bool {
+	stdout_interactive() && !flags.no_color
+}
+
+fn help_rule(flags: OutputFlags, label: &str) {
+	if !stdout_interactive() {
+		return;
+	}
+	let label = clean(label);
+	let rest = "━".repeat(80usize.saturating_sub(label.chars().count() + 8));
+	let c = stdout_colored(flags);
+	println!(
+		"  {}  {}  {}",
+		style::paint("━━", Color::Muted, c),
+		style::paint(&label, Color::Heading, c),
+		style::paint(&rest, Color::Muted, c),
+	);
+}
+
+fn help_line(flags: OutputFlags, text: &str, color: Color) {
+	println!("  {}", style::paint(&clean(text), color, stdout_colored(flags)));
+}
+
+fn help_blank() {
+	println!();
+}
+
+fn help_group(flags: OutputFlags, title: &str, description: &str) {
+	help_blank();
+	help_line(flags, &format!("{title} — {description}"), Color::Heading);
 }
 
 fn option(flags: OutputFlags, spec: &OptionSpec) {
@@ -35,50 +66,18 @@ fn option(flags: OutputFlags, spec: &OptionSpec) {
 		.filter(|value| *value != "false")
 		.map(|value| format!(" (default: {value})"))
 		.unwrap_or_default();
-	if render::interactive() {
-		line(
-			flags,
-			&format!("{} {}  {}{default}", column(&name, 24), column(&alias, 3), spec.description),
-			Color::Text,
-		);
-	} else {
-		let alias = if alias.is_empty() { String::new() } else { format!(", {alias}") };
-		println!("  {name}{alias}  {}{default}", spec.description);
-	}
-}
-
-fn help_line(flags: OutputFlags, text: &str, color: Color) {
-	if render::interactive() {
-		line(flags, text, color);
-	} else {
-		println!("  {text}");
-	}
-}
-
-fn help_blank(flags: OutputFlags) {
-	if render::interactive() {
-		blank(flags);
-	} else {
-		println!();
-	}
-}
-
-fn help_group(flags: OutputFlags, title: &str, description: &str) {
-	if render::interactive() {
-		group(flags, title, description);
-	} else {
-		println!();
-		println!("  {title} — {description}");
-	}
+	help_line(
+		flags,
+		&format!("{} {}  {}{default}", column(&name, 24), column(&alias, 3), spec.description),
+		Color::Text,
+	);
 }
 
 pub(super) fn show(flags: OutputFlags, command: Option<&str>) {
 	let flags = OutputFlags { quiet: false, ..flags };
 	let command = command.unwrap_or("");
 	let canonical = canonical_command(command).unwrap_or(command);
-	if render::interactive() {
-		rule(flags, if command.is_empty() { "flora" } else { command });
-	}
+	help_rule(flags, if command.is_empty() { "flora" } else { command });
 	let description = match canonical {
 		"upload" => {
 			"Upload a file, a folder, or stdin (alias: up). Interrupted uploads can resume."
@@ -93,10 +92,10 @@ pub(super) fn show(flags: OutputFlags, command: Option<&str>) {
 		_ => "Permanent file storage you host yourself.",
 	};
 	help_line(flags, description, Color::Dim);
-	help_blank(flags);
+	help_blank();
 	help_line(flags, "USAGE:", Color::Dim);
 	help_line(flags, usage(command), Color::Text);
-	help_blank(flags);
+	help_blank();
 	help_line(flags, "Flags override FLORA_<FLAG_NAME> environment variables.", Color::Dim);
 	if command.is_empty() {
 		help_group(flags, "commands", "work with files and run the server");
@@ -132,7 +131,7 @@ pub(super) fn show(flags: OutputFlags, command: Option<&str>) {
 		] {
 			help_line(flags, example, Color::Dim);
 		}
-		help_blank(flags);
+		help_blank();
 		help_line(flags, "Run flora <command> --help for command options.", Color::Muted);
 	}
 }

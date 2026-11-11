@@ -15,7 +15,7 @@ use std::{
 	path::{Path, PathBuf},
 	time::Instant,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use xxhash_rust::xxh3::Xxh3;
 
 const RANGE_SIZE: u64 = 8_000_000;
@@ -43,8 +43,8 @@ impl Source {
 		}
 	}
 
-	fn request(&self) -> reqwest::RequestBuilder {
-		let mut request = self.http.get(&self.url);
+	fn request_method(&self, method: reqwest::Method) -> reqwest::RequestBuilder {
+		let mut request = self.http.request(method, &self.url);
 		if let Some(token) = &self.token {
 			request = request.bearer_auth(token);
 		}
@@ -54,7 +54,21 @@ impl Source {
 		request
 	}
 
-	async fn range(&self, start: u64, end: u64, size: u64, etag: &str) -> Result<reqwest::Response> {
+	fn request(&self) -> reqwest::RequestBuilder {
+		self.request_method(reqwest::Method::GET)
+	}
+
+	fn head(&self) -> reqwest::RequestBuilder {
+		self.request_method(reqwest::Method::HEAD)
+	}
+
+	async fn range(
+		&self,
+		start: u64,
+		end: u64,
+		size: u64,
+		etag: &str,
+	) -> Result<reqwest::Response> {
 		let response = checked(
 			send(
 				self.request()
@@ -88,17 +102,27 @@ pub(super) async fn run(global: &GlobalOptions, down: &DownloadConfig) -> Result
 	let verbose_log = matches!(global.log.to_ascii_lowercase().as_str(), "debug" | "trace");
 	let started = Instant::now();
 	let source = Source::from_target(global, &down.target)?;
-	let mut response = checked(send(source.request()).await?).await?;
-	tracing::debug!("download response received");
-
 	if down.output.as_deref() == Some("-") {
+		let mut response = checked(send(source.request()).await?).await?;
 		return stream_stdout(&mut response).await;
 	}
 
+	let probe = send(source.head()).await?;
+	let (headers, body_response) = if matches!(
+		probe.status(),
+		reqwest::StatusCode::METHOD_NOT_ALLOWED | reqwest::StatusCode::NOT_IMPLEMENTED
+	) {
+		let get_resp = checked(send(source.request()).await?).await?;
+		(get_resp.headers().clone(), Some(get_resp))
+	} else {
+		let head_resp = checked(probe).await?;
+		(head_resp.headers().clone(), None)
+	};
+	tracing::debug!("download metadata received");
+
 	let cmd = down.label;
 	rule(flags, cmd);
-	let disposition = response
-		.headers()
+	let disposition = headers
 		.get(reqwest::header::CONTENT_DISPOSITION)
 		.and_then(|v| v.to_str().ok())
 		.unwrap_or("");
@@ -122,14 +146,18 @@ pub(super) async fn run(global: &GlobalOptions, down: &DownloadConfig) -> Result
 	}
 
 	let partial = partial_path(&destination, name);
-	let (mut exists, mut offset) = match tokio::fs::symlink_metadata(&partial).await {
+	let (exists, offset) = match tokio::fs::symlink_metadata(&partial).await {
 		Ok(metadata) if metadata.file_type().is_file() => (true, metadata.len()),
 		Ok(_) => bail!("partial download is not a regular file: {}", partial.display()),
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, 0),
 		Err(error) => return Err(error.into()),
 	};
 
-	let size = response.content_length();
+	let size = headers
+		.get(reqwest::header::CONTENT_LENGTH)
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| v.parse::<u64>().ok())
+		.or_else(|| body_response.as_ref().and_then(reqwest::Response::content_length));
 	if let Ok(url) = reqwest::Url::parse(&source.url)
 		&& let Some(host) = url.host_str()
 	{
@@ -144,20 +172,15 @@ pub(super) async fn run(global: &GlobalOptions, down: &DownloadConfig) -> Result
 		bail!("partial download is larger than the server file: {}", partial.display());
 	}
 
-	let etag = response
-		.headers()
-		.get(reqwest::header::ETAG)
-		.and_then(|v| v.to_str().ok())
-		.map(str::to_owned);
+	let etag = headers.get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned);
 	let ranges =
-		response.headers().get(reqwest::header::ACCEPT_RANGES).and_then(|v| v.to_str().ok())
-			== Some("bytes");
+		headers.get(reqwest::header::ACCEPT_RANGES).and_then(|v| v.to_str().ok()) == Some("bytes");
 	let expected_xxh3 = etag.as_deref().and_then(flora_xxh3_etag);
 
 	if let (Some(size), Some(etag)) = (size, etag.as_deref().filter(|_| ranges))
 		&& (size > RANGE_SIZE || (offset > 0 && expected_xxh3.is_some()))
 	{
-		drop(response);
+		drop(body_response);
 		if offset > 0 {
 			row(flags, cmd, "resume", &bytes(offset), Color::Dim);
 		}
@@ -172,14 +195,8 @@ pub(super) async fn run(global: &GlobalOptions, down: &DownloadConfig) -> Result
 		.buffered(down.parallel);
 		tokio::pin!(requests);
 
-		let mut bar = ProgressBar::new(
-			flags,
-			cmd,
-			"download",
-			Some(size),
-			ProgressUnit::Bytes,
-			verbose_log,
-		);
+		let mut bar =
+			ProgressBar::new(flags, cmd, "download", Some(size), ProgressUnit::Bytes, verbose_log);
 		let mut completed = offset;
 		if completed > 0 && completed == size {
 			bar.update(completed);
@@ -198,7 +215,9 @@ pub(super) async fn run(global: &GlobalOptions, down: &DownloadConfig) -> Result
 			&& !verify_file_xxh3(&partial, expected_hash).await?
 		{
 			let _ = tokio::fs::remove_file(&partial).await;
-			bail!("downloaded file failed XXH3-128 verification (corrupt or stale partial file removed)");
+			bail!(
+				"downloaded file failed XXH3-128 verification (corrupt or stale partial file removed)"
+			);
 		}
 
 		finish(&partial, &destination).await?;
@@ -206,24 +225,16 @@ pub(super) async fn run(global: &GlobalOptions, down: &DownloadConfig) -> Result
 		return Ok(());
 	}
 
-	if offset > 0 {
+	if exists {
 		tokio::fs::remove_file(&partial).await?;
-		exists = false;
-		offset = 0;
 	}
+	let response = match body_response {
+		Some(resp) => resp,
+		None => checked(send(source.request()).await?).await?,
+	};
 	blank(flags);
-	let saved = save_stream(
-		flags,
-		cmd,
-		verbose_log,
-		response,
-		&partial,
-		exists,
-		offset,
-		size,
-		expected_xxh3,
-	)
-	.await?;
+	let saved =
+		save_stream(flags, cmd, verbose_log, response, &partial, size, expected_xxh3).await?;
 	finish(&partial, &destination).await?;
 	download_done(flags, cmd, &display_dest, saved, started);
 	Ok(())
@@ -263,21 +274,11 @@ fn resolve_filename(source: &Source, disposition: &str) -> String {
 
 fn flora_xxh3_etag(etag: &str) -> Option<&str> {
 	let trimmed = etag.strip_prefix('"')?.strip_suffix('"')?;
-	(trimmed.len() == 32 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())).then_some(trimmed)
+	core::hex::is_hex_128(trimmed).then_some(trimmed)
 }
 
 async fn verify_file_xxh3(path: &Path, expected: &str) -> Result<bool> {
-	let mut file = tokio::fs::File::open(path).await?;
-	let mut buf = vec![0u8; 64 * 1024];
-	let mut hash = Xxh3::new();
-	loop {
-		let n = file.read(&mut buf).await?;
-		if n == 0 {
-			break;
-		}
-		hash.update(&buf[..n]);
-	}
-	Ok(format!("{:032x}", hash.digest128()).eq_ignore_ascii_case(expected))
+	Ok(core::hex::hash_file_async(path).await?.eq_ignore_ascii_case(expected))
 }
 
 fn download_done(flags: OutputFlags, cmd: &str, destination: &str, saved: u64, started: Instant) {
@@ -296,7 +297,8 @@ fn partial_path(destination: &Path, name: &str) -> PathBuf {
 	if name.len() + SUFFIX.len() <= 255 {
 		return destination.with_file_name(format!("{name}{SUFFIX}"));
 	}
-	let suffix = format!("-{:032x}{SUFFIX}", xxhash_rust::xxh3::xxh3_128(name.as_bytes()));
+	let suffix =
+		format!("-{}{SUFFIX}", core::hex::u128(xxhash_rust::xxh3::xxh3_128(name.as_bytes())));
 	let mut end = 255 - suffix.len();
 	while !name.is_char_boundary(end) {
 		end -= 1;
@@ -335,19 +337,16 @@ async fn fetch_piece(
 	Ok(piece)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn save_stream(
 	flags: OutputFlags,
 	cmd: &str,
 	verbose_log: bool,
 	mut response: reqwest::Response,
 	partial: &Path,
-	exists: bool,
-	offset: u64,
 	size: Option<u64>,
 	expected_xxh3: Option<&str>,
 ) -> Result<u64> {
-	let mut file = open_partial(partial, exists).await?;
+	let mut file = open_partial(partial, false).await?;
 	let mut bar = ProgressBar::new(flags, cmd, "download", size, ProgressUnit::Bytes, verbose_log);
 	let mut hash = Xxh3::new();
 	let mut saved = 0u64;
@@ -358,7 +357,7 @@ async fn save_stream(
 		}
 		hash.update(&chunk);
 		file.write_all(&chunk).await?;
-		bar.update(offset.saturating_add(saved));
+		bar.update(saved);
 	}
 	drop(bar);
 	if size.is_some_and(|total| saved != total) {
@@ -367,7 +366,7 @@ async fn save_stream(
 	file.sync_all().await?;
 	drop(file);
 	if let Some(expected) = expected_xxh3
-		&& !format!("{:032x}", hash.digest128()).eq_ignore_ascii_case(expected)
+		&& !core::hex::u128(hash.digest128()).eq_ignore_ascii_case(expected)
 	{
 		let _ = tokio::fs::remove_file(partial).await;
 		bail!("downloaded file failed XXH3-128 verification");

@@ -15,6 +15,7 @@ const MAX_SEARCH_RESULTS: usize = 500;
 const MAX_TEXT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Search {
 	q: String,
 	owner: Option<String>,
@@ -25,13 +26,13 @@ pub(super) async fn search(
 	headers: HeaderMap,
 	Query(query): Query<Search>,
 ) -> Result<Json<Vec<FileRecord>>> {
-	let principal = auth::authenticate(&app, &headers)?;
-	let owner = files::owner(&app, &principal, query.owner.as_deref())?;
-	let term: String = query.q.chars().flat_map(char::to_lowercase).collect();
-	if term.is_empty() || term.len() > 1024 {
+	let principal = auth::authenticate(&app, &headers).await?;
+	let owner = files::owner(&app, &principal, query.owner.as_deref()).await?;
+	if query.q.trim().is_empty() || query.q.len() > 1024 {
 		return Err(bad("search term must be between 1 and 1024 bytes"));
 	}
-	let records: Vec<FileRecord> = app.db.list(&db::files(&owner))?;
+	let term: String = query.q.chars().flat_map(char::to_lowercase).collect();
+	let records: Vec<FileRecord> = app.db.list_async(&db::files(&owner)).await?;
 	let mut matches = Vec::new();
 	for record in records {
 		if matches.len() >= MAX_SEARCH_RESULTS {
@@ -46,7 +47,7 @@ pub(super) async fn search(
 		} else if record.size <= MAX_TEXT_SCAN_BYTES {
 			let path = core::safe_join_async(&app.storage.join(&owner), &record.path)
 				.await
-				.map_err(|error| bad(error.to_string()))?;
+				.map_err(bad)?;
 			contains_text(&path, &term).await?
 		} else {
 			false
@@ -79,15 +80,19 @@ async fn contains_text(path: &Path, term: &str) -> Result<bool> {
 			Err(error) if error.error_len().is_none() && read != 0 => error.valid_up_to(),
 			Err(_) => return Ok(false),
 		};
-		let text = std::str::from_utf8(&bytes[..valid]).map_err(anyhow::Error::from)?;
 		if !found {
+			let text = std::str::from_utf8(&bytes[..valid]).map_err(anyhow::Error::from)?;
 			window.extend(text.chars().flat_map(char::to_lowercase));
 			found = window.contains(term);
-			let mut start = window.len().saturating_sub(term.len().saturating_sub(1));
-			while !window.is_char_boundary(start) {
-				start -= 1;
+			if found {
+				window = String::new();
+			} else {
+				let mut start = window.len().saturating_sub(term.len().saturating_sub(1));
+				while !window.is_char_boundary(start) {
+					start -= 1;
+				}
+				window.drain(..start);
 			}
-			window.drain(..start);
 		}
 		remaining = length - valid;
 		bytes.copy_within(valid..length, 0);

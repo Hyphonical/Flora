@@ -11,7 +11,7 @@ const RULE_WIDTH: usize = 80;
 const BAR_WIDTH: usize = 28;
 
 pub(super) fn interactive() -> bool {
-	std::io::stderr().is_terminal()
+	std::io::stderr().is_terminal() && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
 }
 
 fn colored(flags: OutputFlags) -> bool {
@@ -79,17 +79,11 @@ pub(super) fn done(flags: OutputFlags, command: &str, label: &str, message: &str
 pub(super) fn failure(flags: OutputFlags, command: &str, message: &str) {
 	let text = clean(message);
 	if interactive() {
-		eprintln!(
-			"  {}",
-			style::paint(&format!("✕  {text}"), Color::Error, colored(flags)),
-		);
+		eprintln!("  {}", style::paint(&format!("✕  {text}"), Color::Error, colored(flags)),);
 	} else if command.is_empty() {
 		eprintln!("{}  error  {text}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"));
 	} else {
-		eprintln!(
-			"{}  {command}  error  {text}",
-			chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-		);
+		eprintln!("{}  {command}  error  {text}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),);
 	}
 }
 
@@ -224,7 +218,11 @@ impl<'a> ProgressBar<'a> {
 			"━".repeat(fill),
 			"─".repeat(BAR_WIDTH - fill),
 		);
-		eprint!("{}{}", style::clear_line(), style::paint(&summary, Color::Accent, colored(self.flags)));
+		eprint!(
+			"{}{}",
+			style::clear_line(),
+			style::paint(&summary, Color::Accent, colored(self.flags))
+		);
 		if done >= total {
 			eprintln!();
 			self.active = false;

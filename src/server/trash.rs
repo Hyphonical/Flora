@@ -11,10 +11,11 @@ use axum::{
 	http::{HeaderMap, StatusCode},
 };
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 use uuid::Uuid;
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TrashQuery {
 	owner: Option<String>,
 }
@@ -26,7 +27,7 @@ async fn paths(
 	entry: &TrashEntry,
 ) -> Result<(PathBuf, PathBuf, PathBuf)> {
 	Uuid::parse_str(id).map_err(|_| bad("invalid trash identifier"))?;
-	let path = core::clean_path(&entry.path, false).map_err(|error| bad(error.to_string()))?;
+	let path = core::clean_path(&entry.path, false).map_err(bad)?;
 	if path != entry.path {
 		return Err(bad("invalid original trash path"));
 	}
@@ -39,21 +40,16 @@ async fn paths(
 		}
 	}
 	let root = app.storage.join(owner);
-	let directory = core::safe_join_async(&root, &format!(".trash/{id}"))
-		.await
-		.map_err(|error| bad(error.to_string()))?;
-	let stored = core::safe_join_async(&root, &format!(".trash/{id}/content/{path}"))
-		.await
-		.map_err(|error| bad(error.to_string()))?;
-	let original = core::safe_join_async(&root, &path)
-		.await
-		.map_err(|error| bad(error.to_string()))?;
+	let directory = core::safe_join_async(&root, &format!(".trash/{id}")).await.map_err(bad)?;
+	let stored =
+		core::safe_join_async(&root, &format!(".trash/{id}/content/{path}")).await.map_err(bad)?;
+	let original = core::safe_join_async(&root, &path).await.map_err(bad)?;
 	Ok((directory, stored, original))
 }
 
 pub(super) async fn delete(app: &App, owner: &str, path: &str) -> Result<()> {
 	recover_user(app, owner).await?;
-	let records = files::scoped_records(app, owner, path)?;
+	let records = files::scoped_records(app, owner, path).await?;
 	let id = Uuid::new_v4().to_string();
 	let entry = TrashEntry {
 		path: path.to_owned(),
@@ -78,7 +74,7 @@ pub(super) async fn delete(app: &App, owner: &str, path: &str) -> Result<()> {
 		.iter()
 		.map(|record| db::file(owner, &record.path))
 		.collect();
-	app.db.write_batch::<FileRecord>(&[], &deletes)?;
+	app.db.write_batch_async::<FileRecord>(&[], &deletes).await?;
 	personal.trash.get_mut(&id).ok_or_else(missing)?.state = TrashState::Ready;
 	profile::save(app, owner, &personal).await?;
 	Ok(())
@@ -89,14 +85,17 @@ pub(super) async fn list(
 	headers: HeaderMap,
 	Query(query): Query<TrashQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>> {
-	let principal = auth::authenticate(&app, &headers)?;
-	let owner = files::owner(&app, &principal, query.owner.as_deref())?;
+	let principal = auth::authenticate(&app, &headers).await?;
+	let owner = files::owner(&app, &principal, query.owner.as_deref()).await?;
 	if !files::allowed(&principal, &owner, "", true) {
 		return Err(forbidden());
 	}
-	let _guard = app.mutation.lock().await;
-	recover_user(&app, &owner).await?;
-	let personal = profile::load(&app, &owner).await?;
+	let mut personal = profile::load(&app, &owner).await?;
+	if personal.trash.values().any(|entry| entry.state != TrashState::Ready) {
+		let _guard = app.user_locks.lock(&owner).await;
+		recover_user(&app, &owner).await?;
+		personal = profile::load(&app, &owner).await?;
+	}
 	let entries = personal
 		.trash
 		.into_iter()
@@ -119,19 +118,19 @@ pub(super) async fn restore(
 	headers: HeaderMap,
 	Query(query): Query<TrashQuery>,
 ) -> Result<StatusCode> {
-	let principal = auth::authenticate(&app, &headers)?;
-	let owner = files::owner(&app, &principal, query.owner.as_deref())?;
+	let principal = auth::authenticate(&app, &headers).await?;
+	let owner = files::owner(&app, &principal, query.owner.as_deref()).await?;
 	if !files::allowed(&principal, &owner, "", true) {
 		return Err(forbidden());
 	}
-	let _guard = app.mutation.lock().await;
+	let _guard = app.user_locks.lock(&owner).await;
 	recover_user(&app, &owner).await?;
 	let mut personal = profile::load(&app, &owner).await?;
 	let entry = personal.trash.get(&id).cloned().ok_or_else(missing)?;
 	if entry.state != TrashState::Ready {
 		return Err(conflict("trash item is being recovered"));
 	}
-	let active_uploads: Vec<Upload> = app.db.list("upload/")?;
+	let active_uploads: Vec<Upload> = app.db.list_async("upload/").await?;
 	if active_uploads.iter().any(|u| {
 		u.owner == owner
 			&& (core::scoped(&entry.path, &u.path) || core::scoped(&u.path, &entry.path))
@@ -140,7 +139,7 @@ pub(super) async fn restore(
 	}
 	let mut ancestor = entry.path.as_str();
 	while let Some((parent, _)) = ancestor.rsplit_once('/') {
-		if app.db.get::<FileRecord>(&db::file(&owner, parent))?.is_some() {
+		if app.db.get_async::<FileRecord>(&db::file(&owner, parent)).await?.is_some() {
 			return Err(conflict("a parent of the original path is now a file"));
 		}
 		ancestor = parent;
@@ -171,12 +170,9 @@ pub(super) async fn restore(
 	personal.trash.get_mut(&id).ok_or_else(missing)?.state = TrashState::Restoring;
 	profile::save(&app, &owner, &personal).await?;
 	tokio::task::spawn_blocking(move || core::rename::no_replace(&stored, &original)).await??;
-	let puts: Vec<(String, FileRecord)> = entry
-		.records
-		.into_iter()
-		.map(|record| (db::file(&owner, &record.path), record))
-		.collect();
-	app.db.write_batch(&puts, &[])?;
+	let puts: Vec<(String, FileRecord)> =
+		entry.records.into_iter().map(|record| (db::file(&owner, &record.path), record)).collect();
+	app.db.write_batch_async(&puts, &[]).await?;
 	personal.trash.remove(&id);
 	profile::save(&app, &owner, &personal).await?;
 	if tokio::fs::try_exists(&directory).await? {
@@ -186,8 +182,9 @@ pub(super) async fn restore(
 }
 
 pub(super) async fn recover(app: &App) -> Result<()> {
-	let users: Vec<User> = app.db.list("user/")?;
+	let users: Vec<User> = app.db.list_async("user/").await?;
 	for user in users {
+		let _guard = app.user_locks.lock(&user.id).await;
 		recover_user(app, &user.id).await?;
 	}
 	Ok(())
@@ -210,7 +207,7 @@ pub(super) async fn recover_user(app: &App, owner: &str) -> Result<()> {
 			TrashState::Deleting if stored_exists && !original_exists => {
 				let deletes: Vec<String> =
 					entry.records.iter().map(|r| db::file(owner, &r.path)).collect();
-				app.db.write_batch::<FileRecord>(&[], &deletes)?;
+				app.db.write_batch_async::<FileRecord>(&[], &deletes).await?;
 				if let Some(item) = personal.trash.get_mut(&id) {
 					item.state = TrashState::Ready;
 				}
@@ -221,12 +218,9 @@ pub(super) async fn recover_user(app: &App, owner: &str) -> Result<()> {
 				changed = true;
 			}
 			TrashState::Restoring if original_exists && !stored_exists => {
-				let puts: Vec<(String, FileRecord)> = entry
-					.records
-					.into_iter()
-					.map(|r| (db::file(owner, &r.path), r))
-					.collect();
-				app.db.write_batch(&puts, &[])?;
+				let puts: Vec<(String, FileRecord)> =
+					entry.records.into_iter().map(|r| (db::file(owner, &r.path), r)).collect();
+				app.db.write_batch_async(&puts, &[]).await?;
 				personal.trash.remove(&id);
 				if tokio::fs::try_exists(&directory).await? {
 					tokio::fs::remove_dir_all(directory).await?;
@@ -286,8 +280,12 @@ pub(super) async fn purge_items(app: &App, owner: &str, ids: &[String]) -> Resul
 		}
 	}
 	profile::save(app, owner, &personal).await?;
+	let mut purged_hashes = HashSet::new();
 	for id in ids {
 		if let Some(entry) = personal.trash.get(id) {
+			for record in &entry.records {
+				purged_hashes.insert(record.hash.clone());
+			}
 			let (directory, _, _) = paths(app, owner, id, entry).await?;
 			if tokio::fs::try_exists(&directory).await? {
 				tokio::fs::remove_dir_all(directory).await?;
@@ -296,6 +294,9 @@ pub(super) async fn purge_items(app: &App, owner: &str, ids: &[String]) -> Resul
 		personal.trash.remove(id);
 	}
 	profile::save(app, owner, &personal).await?;
+	if !purged_hashes.is_empty() {
+		super::ops::evict_unused_thumbnails(app, owner, &purged_hashes).await?;
+	}
 	Ok(())
 }
 

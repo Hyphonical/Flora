@@ -40,10 +40,9 @@ impl RemoteTreeCache {
 		parent: &str,
 	) -> Result<Option<&HashMap<String, Entry>>> {
 		if !self.listings.contains_key(parent) {
-			let response = send(
-				client.request(reqwest::Method::GET, "/api/files").query(&[("path", parent)]),
-			)
-			.await?;
+			let response =
+				send(client.request(reqwest::Method::GET, "/api/files").query(&[("path", parent)]))
+					.await?;
 			let fetched = match response.status() {
 				reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN => None,
 				_ => {
@@ -110,17 +109,7 @@ impl RemoteTreeCache {
 		let Some(expected) = &entry.hash else {
 			return Ok(false);
 		};
-		let mut file = tokio::fs::File::open(source).await?;
-		let mut buffer = vec![0u8; 65536];
-		let mut hash = Xxh3::new();
-		loop {
-			let n = file.read(&mut buffer).await?;
-			if n == 0 {
-				break;
-			}
-			hash.update(&buffer[..n]);
-		}
-		Ok(format!("{:032x}", hash.digest128()) == *expected)
+		Ok(core::hex::hash_file_async(source).await?.eq_ignore_ascii_case(expected))
 	}
 }
 
@@ -390,8 +379,7 @@ async fn upload_reader<R: AsyncRead + Unpin>(
 ) -> Result<FileRecord> {
 	let path = core::clean_path(path, false)?;
 	let started = Instant::now();
-	let request =
-		UploadRequest { path: path.clone(), owner: None, size, conflict: up.on_conflict };
+	let request = UploadRequest { path: path.clone(), owner: None, size, conflict: up.on_conflict };
 	let upload: Upload =
 		checked(send(client.request(reqwest::Method::POST, "/api/uploads").json(&request)).await?)
 			.await?
@@ -427,7 +415,7 @@ async fn upload_reader<R: AsyncRead + Unpin>(
 		}
 		whole.update(&buf[..filled]);
 		total += filled as u64;
-		let chunk_hash = format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&buf[..filled]));
+		let chunk_hash = core::hex::u128(xxhash_rust::xxh3::xxh3_128(&buf[..filled]));
 		let present = upload
 			.chunks
 			.get(number)
@@ -475,7 +463,7 @@ async fn upload_reader<R: AsyncRead + Unpin>(
 	if size.is_some_and(|s| s != total) {
 		bail!("source file changed during upload");
 	}
-	let complete = CompleteRequest { hash: format!("{:032x}", whole.digest128()), size: total };
+	let complete = CompleteRequest { hash: core::hex::u128(whole.digest128()), size: total };
 	let url = format!("/api/uploads/{}/complete", upload.id);
 	let record: FileRecord =
 		checked(send(client.request(reqwest::Method::POST, &url).json(&complete)).await?)

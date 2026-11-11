@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Credentials {
@@ -22,7 +23,8 @@ pub(super) struct Client {
 pub(super) fn http_client() -> Result<reqwest::Client> {
 	Ok(reqwest::Client::builder()
 		.user_agent(concat!("Flora/", env!("CARGO_PKG_VERSION")))
-		.timeout(REQUEST_TIMEOUT)
+		.connect_timeout(CONNECT_TIMEOUT)
+		.read_timeout(READ_TIMEOUT)
 		.build()?)
 }
 
@@ -32,11 +34,7 @@ impl Client {
 		if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
 			bail!("server URL must use http or https");
 		}
-		Ok(Self {
-			http: http_client()?,
-			server: server.trim_end_matches('/').to_owned(),
-			token,
-		})
+		Ok(Self { http: http_client()?, server: server.trim_end_matches('/').to_owned(), token })
 	}
 
 	pub(super) fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -61,8 +59,8 @@ pub(super) fn credentials_path() -> Result<PathBuf> {
 
 pub(super) fn load_credentials() -> Result<Credentials> {
 	let path = credentials_path()?;
-	let data = std::fs::read(&path)
-		.with_context(|| format!("not signed in ({})", path.display()))?;
+	let data =
+		std::fs::read(&path).with_context(|| format!("not signed in ({})", path.display()))?;
 	Ok(serde_json::from_slice(&data)?)
 }
 

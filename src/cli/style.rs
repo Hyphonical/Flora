@@ -28,16 +28,17 @@ impl fmt::Display for Styled<'_> {
 		if !self.enabled {
 			return f.write_str(self.text);
 		}
-		let (r, g, b) = match self.color {
-			Color::Heading => (255, 255, 212),
-			Color::Text => (228, 228, 196),
-			Color::Dim => (119, 131, 133),
-			Color::Muted => (79, 84, 86),
-			Color::Accent => (175, 185, 122),
-			Color::Warning => (194, 168, 108),
-			Color::Error => (192, 109, 68),
+		// Adaptive ANSI attributes & standard palette slots remain legible on both
+		// light and dark terminal backgrounds without assuming 24-bit truecolor.
+		let code = match self.color {
+			Color::Heading => "1",
+			Color::Text => return f.write_str(self.text),
+			Color::Dim | Color::Muted => "2",
+			Color::Accent => "32",
+			Color::Warning => "33",
+			Color::Error => "1;31",
 		};
-		write!(f, "\x1b[38;2;{r};{g};{b}m{}\x1b[0m", self.text)
+		write!(f, "\x1b[{code}m{}\x1b[0m", self.text)
 	}
 }
 

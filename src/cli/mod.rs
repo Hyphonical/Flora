@@ -126,12 +126,7 @@ async fn list(global: &GlobalOptions, flags: OutputFlags, path: &str) -> Result<
 	Ok(())
 }
 
-async fn move_file(
-	global: &GlobalOptions,
-	flags: OutputFlags,
-	from: &str,
-	to: &str,
-) -> Result<()> {
+async fn move_file(global: &GlobalOptions, flags: OutputFlags, from: &str, to: &str) -> Result<()> {
 	rule(flags, "mv");
 	let client = client(global)?;
 	checked(
@@ -151,7 +146,8 @@ async fn remove(global: &GlobalOptions, flags: OutputFlags, path: &str) -> Resul
 	rule(flags, "rm");
 	let client = client(global)?;
 	checked(
-		send(client.request(reqwest::Method::DELETE, "/api/files").query(&[("path", path)])).await?,
+		send(client.request(reqwest::Method::DELETE, "/api/files").query(&[("path", path)]))
+			.await?,
 	)
 	.await?;
 	done(flags, "rm", "trashed", path);

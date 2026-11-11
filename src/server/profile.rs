@@ -114,15 +114,29 @@ pub(super) fn recover_writes(app: &App) -> Result<()> {
 		write_contents_sync(app, &item)?;
 		app.db.delete(&format!("profile-write/{}", item.owner))?;
 	}
+	for entry in std::fs::read_dir(&app.storage)? {
+		let entry = entry?;
+		if entry.file_type()?.is_dir() {
+			let leftover = entry.path().join(".flora.tmp");
+			if let Err(err) = std::fs::remove_file(leftover)
+				&& err.kind() != std::io::ErrorKind::NotFound
+			{
+				return Err(err.into());
+			}
+		}
+	}
 	Ok(())
 }
 
 fn write_contents_sync(app: &App, pending: &PendingWrite) -> Result<()> {
 	let root = app.storage.join(&pending.owner);
-	let path = core::safe_join(&root, ".flora")?;
+	let temp = core::safe_join(&root, ".flora.tmp")?;
+	let target = core::safe_join(&root, ".flora")?;
 	let mut file =
-		std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+		std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&temp)?;
 	file.write_all(pending.contents.as_bytes())?;
 	file.sync_all()?;
+	drop(file);
+	std::fs::rename(temp, target)?;
 	Ok(())
 }

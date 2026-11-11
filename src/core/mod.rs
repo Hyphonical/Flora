@@ -24,13 +24,38 @@ pub(crate) struct User {
 	pub retention: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TokenKind {
+	#[default]
+	Account,
+	File,
+	Folder,
+}
+
+impl TokenKind {
+	pub(crate) const fn as_str(self) -> &'static str {
+		match self {
+			Self::Account => "account",
+			Self::File => "file",
+			Self::Folder => "folder",
+		}
+	}
+}
+
+impl fmt::Display for TokenKind {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Token {
 	pub hash: String,
 	pub owner: String,
 	pub scope: String,
 	#[serde(default)]
-	pub kind: String,
+	pub kind: TokenKind,
 	pub session: bool,
 }
 
@@ -171,6 +196,7 @@ pub(crate) struct UploadRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CompleteRequest {
 	pub hash: String,
 	pub size: u64,
@@ -217,8 +243,7 @@ pub(crate) fn duration(input: &str) -> Result<Option<u64>> {
 			'h' => 3600,
 			'd' => 86400,
 			'w' => 604800,
-			'm' => 2592000,
-			_ => bail!("unknown duration unit {unit:?}; use h, d, w or m"),
+			_ => bail!("unknown duration unit {unit:?}; use h, d, w, or never"),
 		};
 		total = total
 			.checked_add(n.checked_mul(multiplier).context("duration too large")?)
@@ -244,6 +269,7 @@ pub(crate) fn clean_path(input: &str, allow_root: bool) -> Result<String> {
 		if component == ".."
 			|| component.len() > 255
 			|| component.eq_ignore_ascii_case(".flora")
+			|| component.eq_ignore_ascii_case(".flora.tmp")
 			|| component.eq_ignore_ascii_case(".trash")
 		{
 			bail!("reserved or invalid path component {component:?}");
@@ -318,4 +344,48 @@ pub(crate) fn scoped(scope: &str, path: &str) -> bool {
 	scope.is_empty()
 		|| path == scope
 		|| path.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn duration_accepts_w_d_h_and_rejects_months_or_duplicates() {
+		assert_eq!(duration("never").unwrap(), None);
+		assert_eq!(duration("2w1d12h").unwrap(), Some(2 * 604_800 + 86_400 + 12 * 3600));
+		assert!(duration("30m").is_err(), "ambiguous 'm' unit must be rejected");
+		assert!(duration("1d2d").is_err(), "duplicate unit must be rejected");
+		assert!(duration("0h").is_err(), "zero duration must be rejected");
+	}
+
+	#[test]
+	fn clean_path_enforces_portable_cross_platform_rules() {
+		assert_eq!(clean_path("/docs//2026/report.pdf", false).unwrap(), "docs/2026/report.pdf");
+		assert_eq!(clean_path("/", true).unwrap(), "");
+		assert!(clean_path("/", false).is_err());
+		for bad_path in [
+			"../secret",
+			"docs\\report.pdf",
+			".flora",
+			".FLORA.TMP",
+			"sub/.trash/file",
+			"CON.txt",
+			"lpt1",
+			"trailing.",
+			"trailing ",
+			"bad:name.txt",
+			"bad|name.txt",
+		] {
+			assert!(clean_path(bad_path, false).is_err(), "expected {bad_path:?} to be rejected");
+		}
+	}
+
+	#[test]
+	fn byte_size_parses_units_and_percentages() {
+		assert_eq!("500MB".parse::<ByteSize>().unwrap().resolve(0).unwrap(), 500_000_000);
+		assert_eq!("2GiB".parse::<ByteSize>().unwrap().resolve(0).unwrap(), 2 * 1024 * 1024 * 1024);
+		assert_eq!("25%".parse::<ByteSize>().unwrap().resolve(4_000).unwrap(), 1_000);
+		assert!("101%".parse::<ByteSize>().is_err());
+	}
 }

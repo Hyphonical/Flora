@@ -86,7 +86,7 @@ curl -fsSL https://files.example.com/install.sh | sh
 irm https://files.example.com/install.ps1 | iex
 ```
 
-`/api/client/<os>-<arch>` serves the running binary when the target matches the server's native platform (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`, `windows-x86_64`, `windows-aarch64`), or a prebuilt binary placed at `<data>/assets/flora-<os>-<arch>`.
+`/api/client/<os>-<arch>` serves the running binary when the target matches the server's native platform (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`, `windows-x86_64`, `windows-aarch64`), or a prebuilt binary placed at `<data>/assets/flora-<os>-<arch>` (`.exe` suffix supported for Windows targets).
 
 ---
 
@@ -133,15 +133,15 @@ Every flag has a matching `FLORA_<FLAG_NAME>` environment variable (for example 
 | `--buffer-retention` | `FLORA_BUFFER_RETENTION` | `7d` | How long abandoned uploads stay buffered (`never` to disable expiry). |
 | `--trash-retention` | `FLORA_TRASH_RETENTION` | `7d` | Default trash retention (`never` or duration; overridable per user). |
 | `--upload-concurrency` | `FLORA_UPLOAD_CONCURRENCY` | `16` | Server-wide semaphore on concurrent chunk writes. |
-| `--rate-limit` | `FLORA_RATE_LIMIT` | `600` | Per-client requests per minute. |
+| `--rate-limit` | `FLORA_RATE_LIMIT` | `600` | Per-client requests per minute (authenticated chunk/range data requests exempt). |
 | `--login-rate-limit` | `FLORA_LOGIN_RATE_LIMIT` | `10` | Per-client `/api/login` and `/api/setup` attempts per minute. |
-| `--behind-proxy` | `FLORA_BEHIND_PROXY` | `false` | Read `CF-Connecting-IP` from trusted proxies and mark session cookies `Secure`. |
-| `--trusted-proxies` | `FLORA_TRUSTED_PROXIES` | *loopback* | Comma-separated proxy IPs or CIDRs allowed to supply `CF-Connecting-IP`. |
+| `--behind-proxy` | `FLORA_BEHIND_PROXY` | `false` | Read `CF-Connecting-IP`, `X-Real-IP`, or `X-Forwarded-For` from trusted proxies and mark session cookies `Secure`. |
+| `--trusted-proxies` | `FLORA_TRUSTED_PROXIES` | *loopback* | Comma-separated proxy IPs or CIDRs allowed to supply forwarded client IPs. |
 | `--log` | `FLORA_LOG` | `info` | Diagnostic log level (`error`, `warn`, `info`, `debug`, `trace`). |
 
 **Value formats:**
 - **Sizes:** decimal (`500MB`, `3GB`), binary (`512MiB`, `3GiB`), raw bytes, or whole-number disk percentages (`10%`, resolved once at startup; `--chunk-size` accepts fixed byte units only).
-- **Durations:** positive combinations of `m` (30 days), `w`, `d`, `h` with each unit used at most once (e.g. `3m2w1d12h`), or `never`.
+- **Durations:** positive combinations of `w`, `d`, `h` with each unit used at most once (e.g. `2w1d12h`), or `never`.
 
 ---
 
@@ -153,7 +153,7 @@ Every flag has a matching `FLORA_<FLAG_NAME>` environment variable (for example 
 data/
 ├── fjall/                  users, roles, quotas, token hashes, file index, activity
 ├── assets/                 optional flora-<os>-<arch> binaries for /install.*
-└── thumbnails/<uuid>/      on-demand WebP/PNG thumbnail cache
+└── thumbnails/<uuid>/      on-demand WebP thumbnail cache
 
 buffer/
 └── <uuid>/<upload-id>/     in-flight upload chunks (space reserved upfront)
@@ -166,8 +166,8 @@ storage/
 ```
 
 - **Crash & index recovery:** On startup, Flora finishes interrupted `.flora` writes, recovers in-progress trash/upload states, and reconciles the Fjall file index against `storage/`. If Fjall is lost, user directories, live files, and trash entries rebuild from `storage/`, while passwords, admin flags, quotas, tokens, and activity history must be reconfigured.
-- **Cross-platform filenames:** Paths use `/` separators and enforce portable rules across Linux, macOS, and Windows: max 255 UTF-8 bytes per segment, no control characters or `<>:"\|?*`, no trailing spaces or dots, no Windows device names (`CON`, `NUL`, `COM1`, `LPT1`, etc.), and `.flora` / `.trash` are reserved.
-- **Reverse proxies:** Flora serves HTTP directly. Terminate TLS at a reverse proxy, and only enable `--behind-proxy` when the proxy strips or overwrites `CF-Connecting-IP` and untrusted clients cannot bypass it.
+- **Cross-platform filenames:** Paths use `/` separators and enforce portable rules across Linux, macOS, and Windows: max 255 UTF-8 bytes per segment, no control characters or `<>:"\|?*`, no trailing spaces or dots, no Windows device names (`CON`, `NUL`, `COM1`, `LPT1`, etc.), and `.flora` / `.flora.tmp` / `.trash` are reserved.
+- **Reverse proxies:** Flora serves HTTP directly. Terminate TLS at a reverse proxy, and only enable `--behind-proxy` when the proxy strips or overwrites forwarded IP headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`) and untrusted clients cannot bypass it.
 
 ---
 

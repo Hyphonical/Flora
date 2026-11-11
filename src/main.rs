@@ -9,8 +9,8 @@ use core::config::{Command, Config, OutputFlags};
 
 #[tokio::main]
 async fn main() {
-	let early_flags = OutputFlags::from_process();
-	let config = match Config::parse() {
+	let mut early_flags = OutputFlags::from_env();
+	let config = match Config::parse(&mut early_flags) {
 		Ok(config) => config,
 		Err(error) => {
 			cli::error(early_flags, None, &format!("{error:#}"));
@@ -18,11 +18,7 @@ async fn main() {
 		}
 	};
 	if let Err(error) = run(&config).await {
-		cli::error(
-			config.output_flags(),
-			Some(config.action.name()),
-			&format!("{error:#}"),
-		);
+		cli::error(config.output_flags(), Some(config.action.name()), &format!("{error:#}"));
 		std::process::exit(1);
 	}
 }

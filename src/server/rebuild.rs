@@ -3,10 +3,8 @@
 use super::{App, db, profile};
 use crate::core::{self, FileRecord, User};
 use anyhow::{Context, Result};
-use std::{collections::HashMap, io::Read, path::Path};
+use std::{collections::HashMap, path::Path};
 use uuid::Uuid;
-use xxhash_rust::xxh3::Xxh3;
-
 pub(super) fn rebuild(app: &App) -> Result<()> {
 	let existing: Vec<User> = app.db.list("user/")?;
 	let rebuilding = app.db.get::<bool>("system/rebuilding")?.unwrap_or(false);
@@ -38,7 +36,7 @@ pub(super) fn rebuild(app: &App) -> Result<()> {
 			quota: None,
 			retention: profile.settings.retention,
 		};
-		app.db.put(&db::user(&id), &user)?;
+		app.db.put_user_sync(None, &user)?;
 		reconcile_user(app, &id)?;
 	}
 	app.db.delete("system/rebuilding")?;
@@ -50,9 +48,10 @@ pub(super) fn sync_profiles(app: &App) -> Result<()> {
 	for mut user in users {
 		let profile = profile::load_sync(app, &user.id)?;
 		if user.name != profile.name || user.retention != profile.settings.retention {
+			let old_name = user.name.clone();
 			user.name = profile.name;
 			user.retention = profile.settings.retention;
-			app.db.put(&db::user(&user.id), &user)?;
+			app.db.put_user_sync(Some(&old_name), &user)?;
 		}
 	}
 	Ok(())
@@ -76,7 +75,8 @@ fn reconcile_user(app: &App, owner: &str) -> Result<()> {
 		.collect();
 	let mut puts = Vec::new();
 	for item in core::walk::walk(&root, |item| {
-		item.file_name() != ".trash" && item.file_name() != ".flora"
+		let name = item.file_name();
+		name != ".trash" && name != ".flora" && name != ".flora.tmp"
 	})? {
 		let item = item?;
 		if !item.file_type()?.is_file() {
@@ -117,21 +117,11 @@ fn make_record(
 	size: u64,
 	modified: u64,
 ) -> Result<FileRecord> {
-	let mut file = std::fs::File::open(source)?;
-	let mut hash = Xxh3::new();
-	let mut buffer = [0u8; 65536];
-	loop {
-		let n = file.read(&mut buffer)?;
-		if n == 0 {
-			break;
-		}
-		hash.update(&buffer[..n]);
-	}
 	Ok(FileRecord {
 		owner: owner.to_owned(),
 		path: path.to_owned(),
 		size,
-		hash: format!("{:032x}", hash.digest128()),
+		hash: core::hex::hash_file_sync(source)?,
 		modified,
 	})
 }

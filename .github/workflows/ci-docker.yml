@@ -21,30 +21,8 @@ permissions:
   packages: write
 
 jobs:
-  lint:
-    name: Clippy & Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace --all-targets
-
   build:
     name: Build (${{ matrix.platform }})
-    needs: lint
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read

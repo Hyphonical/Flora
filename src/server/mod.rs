@@ -46,8 +46,11 @@ pub(crate) struct App {
 	pub limits: Arc<Mutex<ops::Limits>>,
 	pub setup_code: Arc<Mutex<Option<String>>>,
 	pub transfer_locks: Arc<transfer_locks::Registry>,
+	pub user_locks: Arc<transfer_locks::UserLocks>,
+	pub accounts: Arc<Mutex<()>>,
+	pub reservation: Arc<Mutex<()>>,
 	pub chunk_permits: Arc<tokio::sync::Semaphore>,
-	pub mutation: Arc<Mutex<()>>,
+	pub thumb_permits: Arc<tokio::sync::Semaphore>,
 }
 
 pub(crate) struct Error(pub StatusCode, pub anyhow::Error);
@@ -83,8 +86,8 @@ impl IntoResponse for Error {
 	}
 }
 
-fn bad(message: impl Into<String>) -> Error {
-	Error(StatusCode::BAD_REQUEST, anyhow::anyhow!(message.into()))
+fn bad(message: impl std::fmt::Display) -> Error {
+	Error(StatusCode::BAD_REQUEST, anyhow::anyhow!("{message}"))
 }
 
 fn forbidden() -> Error {
@@ -95,8 +98,8 @@ fn missing() -> Error {
 	Error(StatusCode::NOT_FOUND, anyhow::anyhow!("not found"))
 }
 
-fn conflict(message: impl Into<String>) -> Error {
-	Error(StatusCode::CONFLICT, anyhow::anyhow!(message.into()))
+fn conflict(message: impl std::fmt::Display) -> Error {
+	Error(StatusCode::CONFLICT, anyhow::anyhow!("{message}"))
 }
 
 pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
@@ -106,6 +109,7 @@ pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
 	let data = std::fs::canonicalize(&config.data)?;
 	let buffer = std::fs::canonicalize(&config.buffer)?;
 	let storage = std::fs::canonicalize(&config.storage)?;
+	std::fs::create_dir_all(storage.join(".staging"))?;
 	if data.starts_with(&buffer)
 		|| data.starts_with(&storage)
 		|| buffer.starts_with(&data)
@@ -155,9 +159,12 @@ pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
 		trusted_proxies: config.trusted_proxies.clone(),
 		limits: Arc::new(Mutex::new(ops::Limits::default())),
 		transfer_locks: Arc::new(transfer_locks::Registry::default()),
+		user_locks: Arc::new(transfer_locks::UserLocks::default()),
+		accounts: Arc::new(Mutex::new(())),
+		reservation: Arc::new(Mutex::new(())),
 		chunk_permits: Arc::new(tokio::sync::Semaphore::new(config.upload_concurrency)),
+		thumb_permits: Arc::new(tokio::sync::Semaphore::new(4)),
 		setup_code: Arc::new(Mutex::new(setup_code)),
-		mutation: Arc::new(Mutex::new(())),
 	};
 	tokio::task::spawn_blocking({
 		let app = app.clone();
@@ -165,6 +172,7 @@ pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
 			profile::recover_writes(&app)?;
 			rebuild::rebuild(&app)?;
 			rebuild::sync_profiles(&app)?;
+			app.db.ensure_indexes()?;
 			Ok(())
 		}
 	})
@@ -177,6 +185,27 @@ pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
 	})
 	.await??;
 
+	let routes = build_router(&app);
+	let listener = tokio::net::TcpListener::bind(&config.listen).await?;
+	tracing::info!(address = %listener.local_addr()?, "listening");
+	let jobs = app.clone();
+	tokio::spawn(async move {
+		loop {
+			tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+			if let Err(error) = files::maintenance(&jobs).await {
+				tracing::error!(%error, "maintenance failed");
+			}
+			if let Err(error) = uploads::recover(&jobs).await {
+				tracing::error!(%error, "upload recovery failed");
+			}
+		}
+	});
+	axum::serve(listener, routes.into_make_service_with_connect_info::<std::net::SocketAddr>())
+		.await?;
+	Ok(())
+}
+
+fn build_router(app: &App) -> Router {
 	let json_routes = Router::new()
 		.route("/install.sh", get(install::shell))
 		.route("/install.ps1", get(install::powershell))
@@ -215,26 +244,278 @@ pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
 		.route("/api/uploads/{id}/{number}", put(uploads::chunk))
 		.layer(DefaultBodyLimit::disable());
 
-	let routes = json_routes
+	json_routes
 		.merge(stream_routes)
 		.layer(axum::middleware::from_fn_with_state(app.clone(), ops::guard))
-		.with_state(app.clone());
+		.with_state(app.clone())
+}
 
-	let listener = tokio::net::TcpListener::bind(&config.listen).await?;
-	tracing::info!(address = %listener.local_addr()?, "listening");
-	let jobs = app.clone();
-	tokio::spawn(async move {
-		loop {
-			tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-			if let Err(error) = files::maintenance(&jobs).await {
-				tracing::error!(%error, "maintenance failed");
-			}
-			if let Err(error) = uploads::recover(&jobs).await {
-				tracing::error!(%error, "upload recovery failed");
-			}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::io::Cursor;
+	use uuid::Uuid;
+
+	struct TempWorkspace {
+		root: PathBuf,
+	}
+
+	impl TempWorkspace {
+		fn new() -> Self {
+			let root = std::env::temp_dir().join(format!("flora-test-{}", Uuid::new_v4()));
+			std::fs::create_dir_all(&root).expect("create temp workspace");
+			Self { root }
 		}
-	});
-	axum::serve(listener, routes.into_make_service_with_connect_info::<std::net::SocketAddr>())
-		.await?;
-	Ok(())
+	}
+
+	impl Drop for TempWorkspace {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.root);
+		}
+	}
+
+	async fn spawn_test_server(ws: &TempWorkspace) -> (String, String, App) {
+		let data = ws.root.join("data");
+		let buffer = ws.root.join("buffer");
+		let storage = ws.root.join("storage");
+		for dir in [&data, &buffer, &storage, &storage.join(".staging")] {
+			std::fs::create_dir_all(dir).expect("create server dirs");
+		}
+		let db = db::Store::open(&data.join("fjall")).expect("open fjall");
+		let setup_code = "test-setup-secret-code".to_owned();
+		let app = App {
+			db,
+			data,
+			buffer,
+			storage,
+			buffer_size: 16 * 1024 * 1024,
+			chunk_size: 64 * 1024,
+			disk_limit: None,
+			buffer_retention: Some(3600),
+			trash_retention: "7d".to_owned(),
+			public_url: Some("https://files.example.com".to_owned()),
+			rate_limit: 600,
+			login_rate_limit: 20,
+			behind_proxy: true,
+			trusted_proxies: vec!["127.0.0.1/32".parse().unwrap()],
+			limits: Arc::new(Mutex::new(ops::Limits::default())),
+			transfer_locks: Arc::new(transfer_locks::Registry::default()),
+			user_locks: Arc::new(transfer_locks::UserLocks::default()),
+			accounts: Arc::new(Mutex::new(())),
+			reservation: Arc::new(Mutex::new(())),
+			chunk_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+			thumb_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+			setup_code: Arc::new(Mutex::new(Some(setup_code.clone()))),
+		};
+		let router = build_router(&app);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+		let addr = listener.local_addr().expect("local addr");
+		tokio::spawn(async move {
+			let _ = axum::serve(
+				listener,
+				router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+			)
+			.await;
+		});
+		(format!("http://{addr}"), setup_code, app)
+	}
+
+	#[tokio::test]
+	async fn end_to_end_transfers_thumbnails_trash_purge_and_rebuild() {
+		let ws = TempWorkspace::new();
+		let (base, setup_code, app) = spawn_test_server(&ws).await;
+		let http = reqwest::Client::new();
+
+		// Unknown JSON fields are rejected instead of silently ignored.
+		let bad_setup = http
+			.post(format!("{base}/api/setup"))
+			.json(
+				&json!({"code": setup_code, "name": "alice", "password": "correct-horse", "typo": true}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(bad_setup.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+		// Valid setup + login.
+		let setup = http
+			.post(format!("{base}/api/setup"))
+			.json(&json!({"code": setup_code, "name": "Alice", "password": "correct-horse"}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(setup.status(), StatusCode::OK);
+
+		let login = http
+			.post(format!("{base}/api/login"))
+			.header("X-Forwarded-For", "198.51.100.42, 127.0.0.1")
+			.json(&json!({"name": "alice", "password": "correct-horse"}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(login.status(), StatusCode::OK);
+		let login_json: serde_json::Value = login.json().await.unwrap();
+		let token = login_json["token"].as_str().unwrap().to_owned();
+		let user_id = login_json["user"]["id"].as_str().unwrap().to_owned();
+
+		// Direct streaming upload rejects malformed X-XXH3-128 upfront.
+		let bad_hash = http
+			.put(format!("{base}/api/upload?path=docs/bad.txt"))
+			.bearer_auth(&token)
+			.header("X-XXH3-128", "not-a-valid-hex-digest")
+			.body("hello")
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(bad_hash.status(), StatusCode::BAD_REQUEST);
+
+		// Multi-chunk upload, single-pass assembly, HEAD probe, and ranged download.
+		let payload: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+		let expected_hash = core::hex::u128(xxhash_rust::xxh3::xxh3_128(&payload));
+		let reservation: core::Upload = http
+			.post(format!("{base}/api/uploads"))
+			.bearer_auth(&token)
+			.json(&json!({"path": "docs/blob.bin", "size": payload.len()}))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		for (idx, part) in payload.chunks(64 * 1024).enumerate() {
+			let put_resp = http
+				.put(format!("{base}/api/uploads/{}/{idx}", reservation.id))
+				.bearer_auth(&token)
+				.header(axum::http::header::CONTENT_LENGTH, part.len())
+				.body(part.to_vec())
+				.send()
+				.await
+				.unwrap();
+			assert_eq!(put_resp.status(), StatusCode::OK);
+		}
+		let completed: core::FileRecord = http
+			.post(format!("{base}/api/uploads/{}/complete", reservation.id))
+			.bearer_auth(&token)
+			.json(&json!({"size": payload.len(), "hash": expected_hash}))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(completed.hash, expected_hash);
+
+		let head_resp = http
+			.head(format!("{base}/api/download?path=docs/blob.bin"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(head_resp.status(), StatusCode::OK);
+		assert_eq!(
+			head_resp.headers().get(axum::http::header::CONTENT_LENGTH).unwrap(),
+			&payload.len().to_string()
+		);
+		assert!(head_resp.bytes().await.unwrap().is_empty());
+
+		let range_resp = http
+			.get(format!("{base}/api/download?path=docs/blob.bin"))
+			.bearer_auth(&token)
+			.header(axum::http::header::RANGE, "bytes=100-199")
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(range_resp.status(), StatusCode::PARTIAL_CONTENT);
+		assert_eq!(range_resp.bytes().await.unwrap().as_ref(), &payload[100..=199]);
+
+		// Upload PNG via simple_upload, fetch WebP thumbnail + 304 Not Modified, then trash & purge.
+		let mut png_bytes = Cursor::new(Vec::new());
+		image::DynamicImage::new_rgba8(16, 16)
+			.write_to(&mut png_bytes, image::ImageFormat::Png)
+			.unwrap();
+		let png_raw = png_bytes.into_inner();
+		let img_record: core::FileRecord = http
+			.put(format!("{base}/api/upload?path=photos/pic.png"))
+			.bearer_auth(&token)
+			.body(png_raw)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+
+		let thumb = http
+			.get(format!("{base}/api/thumbnail?path=photos/pic.png"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(thumb.status(), StatusCode::OK);
+		assert_eq!(thumb.headers().get(axum::http::header::CONTENT_TYPE).unwrap(), "image/webp");
+		let thumb_etag =
+			thumb.headers().get(axum::http::header::ETAG).unwrap().to_str().unwrap().to_owned();
+		let cached_webp =
+			app.data.join("thumbnails").join(&user_id).join(format!("{}.webp", img_record.hash));
+		assert!(cached_webp.exists());
+
+		let not_modified = http
+			.get(format!("{base}/api/thumbnail?path=photos/pic.png"))
+			.bearer_auth(&token)
+			.header(axum::http::header::IF_NONE_MATCH, &thumb_etag)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+
+		// Listing root returns top-level folders without scanning/leaking internal directories.
+		let root_entries: Vec<core::Entry> = http
+			.get(format!("{base}/api/files"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let names: Vec<&str> = root_entries.iter().map(|e| e.name.as_str()).collect();
+		assert_eq!(names, vec!["docs", "photos"]);
+
+		// Trash & purge evicts cached thumbnail.
+		let del = http
+			.delete(format!("{base}/api/files?path=photos/pic.png"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(del.status(), StatusCode::NO_CONTENT);
+		let purge_resp = http
+			.post(format!("{base}/api/purge"))
+			.bearer_auth(&token)
+			.json(&json!({"confirm": true}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(purge_resp.status(), StatusCode::OK);
+		assert!(!cached_webp.exists(), "purging file should evict its cached WebP thumbnail");
+
+		// Windows .exe asset lookup works for /api/client/windows-x86_64.
+		let assets_dir = app.data.join("assets");
+		std::fs::create_dir_all(&assets_dir).unwrap();
+		std::fs::write(assets_dir.join("flora-windows-x86_64.exe"), b"MZ-flora-stub").unwrap();
+		let win_bin = http.get(format!("{base}/api/client/windows-x86_64")).send().await.unwrap();
+		assert_eq!(win_bin.status(), StatusCode::OK);
+		assert_eq!(win_bin.bytes().await.unwrap().as_ref(), b"MZ-flora-stub");
+
+		// Rebuild recovers user & live files from storage/.flora when Fjall is recreated.
+		let fresh_db_dir = ws.root.join("rebuilt-fjall");
+		let rebuilt_app = App { db: db::Store::open(&fresh_db_dir).unwrap(), ..app.clone() };
+		rebuild::rebuild(&rebuilt_app).unwrap();
+		rebuilt_app.db.ensure_indexes().unwrap();
+		let recovered_user = rebuilt_app.db.find_user_by_name_async("ALICE").await.unwrap();
+		assert_eq!(recovered_user.expect("recovered user").id, user_id);
+		let recovered_file: Option<core::FileRecord> =
+			rebuilt_app.db.get(&db::file(&user_id, "docs/blob.bin")).unwrap();
+		assert_eq!(recovered_file.expect("recovered file").hash, expected_hash);
+	}
 }

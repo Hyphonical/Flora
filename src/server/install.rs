@@ -41,10 +41,17 @@ pub(super) async fn binary(State(app): State<App>, Path(target): Path<String>) -
 	if !TARGETS.contains(&target.as_str()) {
 		return Err(missing());
 	}
-	let supplied = app.data.join("assets").join(format!("flora-{target}"));
+	let assets = app.data.join("assets");
+	let exe_candidate =
+		target.starts_with("windows-").then(|| assets.join(format!("flora-{target}.exe")));
+	let plain_candidate = assets.join(format!("flora-{target}"));
 	let native = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-	let file = if tokio::fs::try_exists(&supplied).await? {
-		supplied
+	let file = if let Some(exe) = exe_candidate
+		&& tokio::fs::try_exists(&exe).await?
+	{
+		exe
+	} else if tokio::fs::try_exists(&plain_candidate).await? {
+		plain_candidate
 	} else if target == native {
 		std::env::current_exe()?
 	} else {

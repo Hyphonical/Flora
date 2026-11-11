@@ -1,0 +1,71 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Windows (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            test: true
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+            test: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch }}
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build Release
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Stage Files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\flora.exe" "dist\flora-windows-${{ matrix.arch }}.exe"
+          if (Test-Path LICENSE) { Copy-Item LICENSE dist\ }
+          if (Test-Path README.md) { Copy-Item README.md dist\ }
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flora-windows-${{ matrix.arch }}
+          path: dist/*
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 7

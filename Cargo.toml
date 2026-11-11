@@ -1,0 +1,65 @@
+# Flora package, direct dependencies, lint policy, and release settings.
+[package]
+name = "flora"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.6"
+axum = "0.8"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dirs = "7"
+fjall = "3"
+fs2 = "0.4"
+futures-util = "0.3"
+ipnet = "2"
+percent-encoding = "2"
+mime_guess = "2"
+rpassword = "7"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+needless_pass_by_value = "warn"
+explicit_iter_loop = "warn"
+manual_let_else = "warn"
+cloned_instead_of_copied = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+match_same_arms = "warn"
+unnested_or_patterns = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[lints.rust]
+unreachable_pub = "warn"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = true
+panic         = "abort"

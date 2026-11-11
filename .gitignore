@@ -1,0 +1,10 @@
+/.omp/
+/.mockup/
+/target/
+/PLAN.md
+/dist/
+/data/
+/buffer/
+/storage/
+/docker-compose.yml
+*.partial

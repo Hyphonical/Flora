@@ -1,0 +1,20 @@
+# Build outputs and local dev directories
+/target/
+/dist/
+/data/
+/buffer/
+/storage/
+
+# Repository / tooling metadata
+/.git/
+/.github/
+/.omp/
+/.mockup/
+
+# Docs and editor state
+/PLAN.md
+/README.md
+*.partial
+*.swp
+.DS_Store
+Thumbs.db

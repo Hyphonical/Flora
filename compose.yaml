@@ -1,0 +1,35 @@
+services:
+  flora:
+    build:
+      context: .
+    image: flora:local
+    container_name: flora
+    restart: unless-stopped
+    ports:
+      - "${FLORA_PORT:-8080}:8080"
+    environment:
+      FLORA_LISTEN: 0.0.0.0:8080
+      FLORA_DATA: /var/lib/flora/data
+      FLORA_BUFFER: /var/lib/flora/buffer
+      FLORA_STORAGE: /var/lib/flora/storage
+      FLORA_BUFFER_SIZE: ${FLORA_BUFFER_SIZE:-3GB}
+      FLORA_CHUNK_SIZE: ${FLORA_CHUNK_SIZE:-8MB}
+      FLORA_BUFFER_RETENTION: ${FLORA_BUFFER_RETENTION:-7d}
+      FLORA_TRASH_RETENTION: ${FLORA_TRASH_RETENTION:-7d}
+      FLORA_LOG: ${FLORA_LOG:-info}
+      # Optional settings (uncomment as needed):
+      # FLORA_PUBLIC_URL: https://files.example.com
+      # FLORA_BEHIND_PROXY: "true"
+      # FLORA_TRUSTED_PROXIES: 172.16.0.0/12
+      # Note: if FLORA_DISK_LIMIT is set, data, buffer, and storage must share one volume
+      # (for example, mount a single volume at /var/lib/flora instead of three separate volumes).
+      # FLORA_DISK_LIMIT: 50GB
+    volumes:
+      - flora-data:/var/lib/flora/data
+      - flora-buffer:/var/lib/flora/buffer
+      - flora-storage:/var/lib/flora/storage
+
+volumes:
+  flora-data:
+  flora-buffer:
+  flora-storage:

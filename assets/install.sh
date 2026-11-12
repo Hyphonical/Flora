@@ -1,8 +1,8 @@
 #!/bin/sh
-# Installs the matching Flora binary for Linux or macOS; the server inserts its public URL.
+# Installs the latest Flora release binary for Linux or macOS from GitHub Releases.
 set -eu
 
-base='__FLORA_PUBLIC_URL__'
+releases='https://github.com/Hyphonical/Flora/releases/latest/download'
 
 case "$(uname -s)" in
     Linux) os=linux ;;
@@ -19,7 +19,7 @@ esac
 mkdir -p "$HOME/.local/bin"
 tmp=$(mktemp "$HOME/.local/bin/.flora.XXXXXX")
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
-curl -fsSL "$base/api/client/$os-$arch" -o "$tmp"
+curl -fsSL "$releases/flora-$os-$arch" -o "$tmp"
 chmod 755 "$tmp"
 mv -f "$tmp" "$HOME/.local/bin/flora"
 printf 'Installed %s\n' "$HOME/.local/bin/flora" >&2

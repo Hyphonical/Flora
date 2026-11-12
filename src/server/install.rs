@@ -1,35 +1,29 @@
-//! Serves embedded installer scripts and platform-specific Flora binaries.
+//! Serves embedded installer scripts and redirects client binary requests to GitHub Releases.
 
-use super::{App, Result, bad, missing};
+use super::{Result, missing};
 use axum::{
-	body::Body,
-	extract::{Path, State},
+	extract::Path,
 	http::{StatusCode, header},
 	response::{IntoResponse, Response},
 };
-use tokio_util::io::ReaderStream;
 
-pub(super) async fn shell(State(app): State<App>) -> Result<impl IntoResponse> {
-	let base = app
-		.public_url
-		.as_deref()
-		.ok_or_else(|| bad("set FLORA_PUBLIC_URL to enable the installer"))?
-		.replace('\'', "'\\''");
-	let script = include_str!("../../assets/install.sh").replace("__FLORA_PUBLIC_URL__", &base);
-	Ok(([(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], script))
+const RELEASE_BASE: &str = "https://github.com/Hyphonical/Flora/releases/latest/download";
+
+pub(super) async fn shell() -> impl IntoResponse {
+	(
+		[(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+		include_str!("../../assets/install.sh"),
+	)
 }
 
-pub(super) async fn powershell(State(app): State<App>) -> Result<impl IntoResponse> {
-	let base = app
-		.public_url
-		.as_deref()
-		.ok_or_else(|| bad("set FLORA_PUBLIC_URL to enable the installer"))?
-		.replace('\'', "''");
-	let script = include_str!("../../assets/install.ps1").replace("__FLORA_PUBLIC_URL__", &base);
-	Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], script))
+pub(super) async fn powershell() -> impl IntoResponse {
+	(
+		[(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+		include_str!("../../assets/install.ps1"),
+	)
 }
 
-pub(super) async fn binary(State(app): State<App>, Path(target): Path<String>) -> Result<Response> {
+pub(super) async fn binary(Path(target): Path<String>) -> Result<Response> {
 	const TARGETS: &[&str] = &[
 		"linux-x86_64",
 		"linux-aarch64",
@@ -41,27 +35,11 @@ pub(super) async fn binary(State(app): State<App>, Path(target): Path<String>) -
 	if !TARGETS.contains(&target.as_str()) {
 		return Err(missing());
 	}
-	let assets = app.data.join("assets");
-	let exe_candidate =
-		target.starts_with("windows-").then(|| assets.join(format!("flora-{target}.exe")));
-	let plain_candidate = assets.join(format!("flora-{target}"));
-	let native = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-	let file = if let Some(exe) = exe_candidate
-		&& tokio::fs::try_exists(&exe).await?
-	{
-		exe
-	} else if tokio::fs::try_exists(&plain_candidate).await? {
-		plain_candidate
-	} else if target == native {
-		std::env::current_exe()?
-	} else {
-		return Err(missing());
-	};
-	let file = tokio::fs::File::open(file).await?;
-	let size = file.metadata().await?.len();
+	let ext = if target.starts_with("windows-") { ".exe" } else { "" };
+	let location = format!("{RELEASE_BASE}/flora-{target}{ext}");
 	Ok(Response::builder()
-		.status(StatusCode::OK)
-		.header(header::CONTENT_TYPE, "application/octet-stream")
-		.header(header::CONTENT_LENGTH, size.to_string())
-		.body(Body::from_stream(ReaderStream::new(file)))?)
+		.status(StatusCode::FOUND)
+		.header(header::LOCATION, location)
+		.header(header::CACHE_CONTROL, "no-cache")
+		.body(axum::body::Body::empty())?)
 }

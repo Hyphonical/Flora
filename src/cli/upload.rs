@@ -463,7 +463,7 @@ async fn upload_reader<R: AsyncRead + Unpin>(
 	if size.is_some_and(|s| s != total) {
 		bail!("source file changed during upload");
 	}
-	let complete = CompleteRequest { hash: core::hex::u128(whole.digest128()), size: total };
+	let complete = CompleteRequest { hash: Some(core::hex::u128(whole.digest128())), size: total };
 	let url = format!("/api/uploads/{}/complete", upload.id);
 	let record: FileRecord =
 		checked(send(client.request(reqwest::Method::POST, &url).json(&complete)).await?)

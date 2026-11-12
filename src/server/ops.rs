@@ -1,6 +1,8 @@
 //! Rate limiting, activity, dashboard, WebP thumbnail cache, and purge.
 
-use super::{App, Result, auth, bad, conflict, db, files, forbidden, trash, uploads};
+use super::{
+	App, Result, auth, bad, conflict, db, events::TreeOp, files, forbidden, trash, uploads,
+};
 use crate::core::{self, FileRecord, Upload, User};
 use axum::{
 	Json,
@@ -144,7 +146,11 @@ pub(super) async fn guard(State(app): State<App>, request: Request, next: Next) 
 		}
 		"PATCH" => path == "/api/files" || path.starts_with("/api/users/"),
 		"PUT" => path == "/api/upload",
-		"DELETE" => path == "/api/files" || path.starts_with("/api/tokens/"),
+		"DELETE" => {
+			path == "/api/files"
+				|| path.starts_with("/api/tokens/")
+				|| path.starts_with("/api/trash/")
+		}
 		_ => false,
 	};
 	let response = next.run(request).await;
@@ -399,10 +405,14 @@ pub(super) async fn purge(
 				uploads::remove_upload_artifacts(&app, &upload.owner, &upload.id).await?;
 			}
 			app.transfer_locks.remove(&upload.id);
+			app.events.upload_cancelled(&upload.owner, &upload.id);
 		}
 		for (owner, items) in &trash_items {
 			let _user_guard = app.user_locks.lock(owner).await;
 			trash::purge_items(&app, owner, items).await?;
+			if !items.is_empty() {
+				app.events.emit_tree(owner, TreeOp::Purge, Vec::new());
+			}
 		}
 	}
 	Ok(Json(

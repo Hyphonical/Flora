@@ -2,12 +2,12 @@
 
 Self-hosted permanent file storage in a single Rust binary. `flora` runs both the HTTP server (`flora serve`) and the file transfer CLI (`flora upload`, `flora download`, `flora ls`, `flora mv`, `flora rm`, `flora cat`).
 
-- **Single binary** — server, CLI, and embedded client installers in one executable.
+- **Single binary** — server, CLI, embedded Web UI, and embedded client installers in one executable.
 - **Resumable chunked transfers** — parallel chunked uploads and ranged `.partial` downloads verified end-to-end with XXH3-128.
 - **Plain files on disk** — per-user UUID storage directories with crash-safe trash and rebuildable Fjall metadata.
 - **Scoped sharing** — revocable account tokens and read-only capability URLs (`/t/<token>`) for individual files or folders.
 
-> **Status:** Local storage, HTTP API, and CLI are implemented. The web UI and remote storage backends (WebDAV, SFTP, FTP) are not included yet. Keep backups and place an HTTPS reverse proxy in front of internet-facing instances.
+> **Status:** Local storage, HTTP API, CLI, and the Web UI (Svelte 5, embedded into the binary) are implemented. Remote storage backends (WebDAV, SFTP, FTP) are not included yet. Keep backups and place an HTTPS reverse proxy in front of internet-facing instances.
 
 ---
 
@@ -15,20 +15,32 @@ Self-hosted permanent file storage in a single Rust binary. `flora` runs both th
 
 ### 1. Start the server
 
-With Cargo:
+With Cargo (build the web UI first so it is embedded into the binary):
 
 ```sh
+bun install --cwd web && bun run --cwd web build
 cargo build --locked --release
 ./target/release/flora serve
 ```
 
-Or with Docker Compose:
+Or with Docker Compose (the image builds the web UI and the Rust binary):
 
 ```sh
 docker compose up -d --build
 ```
 
 When no administrator exists, `flora serve` logs a one-time `setup_code` on startup.
+
+The server then serves the web UI at `http://127.0.0.1:8080/` — including the public
+share view at `/t/<share_token>` — while the API stays under `/api`.
+
+For frontend development, run the Vite dev server next to a local backend; it proxies
+`/api`, `/t/`, and `/install.*` to `http://127.0.0.1:8080`:
+
+```sh
+flora serve          # terminal 1
+bun run --cwd web dev # terminal 2 → http://127.0.0.1:5173
+```
 
 ### 2. Create the first admin and an account token
 
@@ -70,24 +82,23 @@ flora down https://files.example.com/t/<share_token>
 
 ## Installing the CLI
 
-Build from source on Linux, macOS, or Windows:
+Install from Git (every Flora server forwards read-only Smart-HTTP Git requests to the upstream repository) or from a local checkout:
 
 ```sh
+cargo install --git https://flora.hypho.dev --locked
+# or locally:
 cargo install --path . --locked
 ```
 
-When a server has `FLORA_PUBLIC_URL` set, it also serves one-command installers at `/install.sh` and `/install.ps1`:
+Every Flora server also serves one-command installers at `/install.sh` and `/install.ps1` that fetch the latest GitHub Release binary for the current OS and architecture (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`, `windows-x86_64`, `windows-aarch64`):
 
 ```sh
 # Linux / macOS
-curl -fsSL https://files.example.com/install.sh | sh
+curl -fsSL https://flora.hypho.dev/install.sh | sh
 
 # Windows (PowerShell)
-irm https://files.example.com/install.ps1 | iex
+irm https://flora.hypho.dev/install.ps1 | iex
 ```
-
-`/api/client/<os>-<arch>` serves the running binary when the target matches the server's native platform (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`, `windows-x86_64`, `windows-aarch64`), or a prebuilt binary placed at `<data>/assets/flora-<os>-<arch>` (`.exe` suffix supported for Windows targets).
-
 ---
 
 ## CLI reference
@@ -123,8 +134,8 @@ Every flag has a matching `FLORA_<FLAG_NAME>` environment variable (for example 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
 | `--listen` | `FLORA_LISTEN` | `0.0.0.0:8080` | TCP bind address. |
-| `--public-url` | `FLORA_PUBLIC_URL` | *unset* | Base `http(s)://` URL used for share links, `Secure` cookies, and `/install.*`. |
-| `--data` | `FLORA_DATA` | `./data` | Fjall database, client binaries, and thumbnail cache. |
+| `--public-url` | `FLORA_PUBLIC_URL` | *unset* | Base `http(s)://` URL used for share links and `Secure` cookies. |
+| `--data` | `FLORA_DATA` | `./data` | Fjall database and thumbnail cache. |
 | `--buffer` | `FLORA_BUFFER` | `./buffer` | Staging directory for in-progress chunked uploads. |
 | `--storage` | `FLORA_STORAGE` | `./storage` | Permanent per-user file storage. |
 | `--buffer-size` | `FLORA_BUFFER_SIZE` | `3GB` | Total upload buffer capacity **and** maximum single-file size. |
@@ -152,7 +163,6 @@ Every flag has a matching `FLORA_<FLAG_NAME>` environment variable (for example 
 ```text
 data/
 ├── fjall/                  users, roles, quotas, token hashes, file index, activity
-├── assets/                 optional flora-<os>-<arch> binaries for /install.*
 └── thumbnails/<uuid>/      on-demand WebP thumbnail cache
 
 buffer/
@@ -173,14 +183,16 @@ storage/
 
 ## HTTP API
 
-Authenticated endpoints accept `Authorization: Bearer <account_token>` or the `flora_session` cookie issued by `POST /api/login`. Tokens are stored as SHA-256 digests and do not expire automatically until revoked.
+Authenticated endpoints accept `Authorization: Bearer <account_token>` or the `flora_session` cookie issued by `POST /api/login` / `POST /api/setup`. Account and session tokens are stored strictly as SHA-256 digests; `file` and `folder` share tokens also retain their capability URL secret so links can be copied again from the UI.
 
 | Method & Path | Auth | Purpose |
 |---|---|---|
-| `POST /api/setup` | Setup code | Create the initial admin (`{ "code", "name", "password" }`). |
+| `GET /api/bootstrap` | Public / Optional | Initial state (`setup_required`, optional signed-in `user`, and server limits). |
+| `POST /api/setup` | Setup code | Create the initial admin (`{ "code", "name", "password" }`) and start a session. |
 | `POST /api/login` | Public | Verify password (Argon2id), set `flora_session`, and return `{ "token", "user" }`. |
+| `POST /api/logout` | Public / Account | Revoke current `flora_session` token and clear the session cookie. |
 | `GET /api/me` | Account | Inspect current user and token scope. |
-| `GET, POST /api/tokens` | Account | List tokens or create `"account"`, `"file"`, or `"folder"` tokens (`scope`, optional admin `owner`). |
+| `GET, POST /api/tokens` | Account | List tokens or create `"account"`, `"file"`, or `"folder"` tokens (`scope`, `label`, `owner`). |
 | `DELETE /api/tokens/{hash}` | Account | Revoke a token by its hash. |
 | `GET, POST /api/users` | Account / Admin | List users or create a user (`POST` requires admin). |
 | `PATCH /api/users/{id}` | Account / Admin | Update password/retention (self or admin) or name/admin/quota (admin). |
@@ -189,19 +201,24 @@ Authenticated endpoints accept `Authorization: Bearer <account_token>` or the `f
 | `PUT /api/uploads/{id}/{number}` | Account | Upload chunk `number` with `Content-Length`. |
 | `POST /api/uploads/{id}/complete` | Account | Verify whole-file XXH3-128 (`{ "size", "hash" }`) and commit to `storage/`. |
 | `PUT /api/upload?path=…` | Account | Single-request streaming upload (`conflict`, `owner`, optional `X-XXH3-128` header). |
-| `GET, POST, PATCH, DELETE /api/files` | Account | List (`?path=`), create folder (`{"path"}`), move (`{"from","to"}`), or trash (`?path=`). |
-| `GET /api/download?path=…` | Account / Scoped | Download a file (supports `Range: bytes=start-end` and XXH3-128 `ETag`). |
-| `GET /t/{token}`, `/t/{token}/{*path}` | Capability URL | Public read-only download or folder listing for a `file` or `folder` token. |
-| `GET /api/trash` | Account | List trashed items for a user. |
+| `GET /api/transfers` | Account | Active upload and download snapshots (`?owner=`, or `?all=1` for admins). |
+| `GET /api/events` | Account | SSE stream (`transfer:started`, `transfer:progress`, `transfer:completed`, `transfer:cancelled`, `tree:changed`). |
+| `GET, POST, PATCH, DELETE /api/files` | Account | Single-pass directory list with folder stats & share links (`?path=`), mkdir, move, or trash. |
+| `GET /api/pastes` | Account | Flat list of text and code files (`<= 2 MiB`) sorted newest-first. |
+| `GET /api/download?path=…` | Account / Scoped | Download a file (`Range`, XXH3-128 `ETag`, `?download=1` attachment, `?preview=1` untracked). |
+| `GET /api/share/{token}[/{*path}]` | Capability URL | JSON metadata for public file or folder share views. |
+| `GET /t/{token}`, `/t/{token}/{*path}` | Capability URL | Serves Web UI share view to browsers (`Accept: text/html`) or streams raw bytes (`curl`, CLI, `?raw=1`, `?download=1`). |
+| `GET /api/trash` | Account | List trashed items with sizes, directory flags, and `expires_at`. |
 | `POST /api/trash/{id}/restore` | Account | Restore a trashed file or folder to its original path. |
+| `DELETE /api/trash/{id}` | Account | Permanently delete a single trashed item. |
 | `POST /api/purge` | Account | Preview (`{"confirm": false}`) or execute (`{"confirm": true}`) upload & trash cleanup. |
 | `GET /api/search?q=…` | Account | On-demand case-insensitive filename + UTF-8 content search (up to 16 MiB per file). |
 | `GET /api/thumbnail?path=…` | Account | Generate and cache an image thumbnail (`JPEG`, `PNG`, `WebP`, `GIF`). |
 | `GET /api/dashboard` | Account | Storage usage, quota, and reserved buffer space. |
 | `GET /api/activity` | Admin | Recent mutating API events (`?limit=`, max `1000`). |
-| `GET /install.sh`, `/install.ps1` | Public | Client install scripts (requires `FLORA_PUBLIC_URL`). |
-| `GET /api/client/{target}` | Public | Download client binary for `<os>-<arch>`. |
-
+| `GET /install.sh`, `/install.ps1` | Public | Client install scripts fetching the latest GitHub Release build. |
+| `GET /api/client/{target}` | Public | `302` redirect to the latest GitHub Release binary for `<os>-<arch>`. |
+| `GET /info/refs`, `POST /git-upload-pack` | Public | Read-only Smart-HTTP Git proxy to GitHub (`cargo install --git`). |
 ### Standard HTTP clients (`curl`)
 
 Scripts and external tools can upload and resume downloads without the `flora` CLI:

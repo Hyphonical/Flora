@@ -144,10 +144,43 @@ async fn create_account(
 	Ok(user)
 }
 
+fn session_cookie(app: &App, secret: &str, clear: bool) -> String {
+	let secure =
+		app.public_url.as_deref().is_some_and(|u| u.starts_with("https://")) || app.behind_proxy;
+	let security = if secure { "; Secure" } else { "" };
+	if clear {
+		format!("flora_session=; HttpOnly{security}; SameSite=Strict; Path=/; Max-Age=0")
+	} else {
+		format!("flora_session={secret}; HttpOnly{security}; SameSite=Strict; Path=/")
+	}
+}
+
+pub(super) async fn bootstrap(
+	State(app): State<App>,
+	headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+	let setup_required = app.setup_code.lock().await.is_some();
+	let user = match authenticate(&app, &headers).await {
+		Ok(p) if p.manage() => Some(UserView::from(p.user)),
+		_ => None,
+	};
+	Ok(Json(serde_json::json!({
+		"setup_required": setup_required,
+		"user": user,
+		"server": {
+			"version": env!("CARGO_PKG_VERSION"),
+			"chunk_size": app.chunk_size,
+			"buffer_size": app.buffer_size,
+			"trash_retention": app.trash_retention,
+			"public_url": app.public_url,
+		}
+	})))
+}
+
 pub(super) async fn setup(
 	State(app): State<App>,
 	Json(request): Json<Setup>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<impl axum::response::IntoResponse> {
 	let mut code = app.setup_code.lock().await;
 	let expected = code.as_ref().ok_or_else(forbidden)?;
 	let expected_digest = Sha256::digest(expected.as_bytes());
@@ -158,7 +191,13 @@ pub(super) async fn setup(
 	let _guard = app.accounts.lock().await;
 	let user = create_account(&app, request.name, request.password, true, None).await?;
 	*code = None;
-	Ok(Json(serde_json::json!({"user": UserView::from(user)})))
+	drop(code);
+	let (secret, _) = issue(&app, &user, String::new(), TokenKind::Account, true, None).await?;
+	let cookie = session_cookie(&app, &secret, false);
+	Ok((
+		[(axum::http::header::SET_COOKIE, cookie)],
+		Json(LoginResponse { token: secret, user: user.into() }),
+	))
 }
 
 async fn issue(
@@ -167,11 +206,22 @@ async fn issue(
 	scope: String,
 	kind: TokenKind,
 	session: bool,
-) -> Result<String> {
+	label: Option<String>,
+) -> Result<(String, Token)> {
 	let secret = random_secret();
-	let record = Token { hash: digest(&secret), owner: user.id.clone(), scope, kind, session };
+	let stored_secret = (kind != TokenKind::Account).then(|| secret.clone());
+	let record = Token {
+		hash: digest(&secret),
+		owner: user.id.clone(),
+		scope,
+		kind,
+		session,
+		created: core::now(),
+		label,
+		secret: stored_secret,
+	};
 	app.db.put_token_async(&record).await?;
-	Ok(secret)
+	Ok((secret, record))
 }
 
 pub(super) async fn login(
@@ -185,18 +235,25 @@ pub(super) async fn login(
 	}
 	let user = matched
 		.ok_or_else(|| Error(StatusCode::UNAUTHORIZED, anyhow::anyhow!("invalid credentials")))?;
-	let secret = issue(&app, &user, String::new(), TokenKind::Account, true).await?;
-	let secure =
-		app.public_url.as_deref().is_some_and(|u| u.starts_with("https://")) || app.behind_proxy;
-	let cookie = if secure {
-		format!("flora_session={secret}; HttpOnly; Secure; SameSite=Strict; Path=/")
-	} else {
-		format!("flora_session={secret}; HttpOnly; SameSite=Strict; Path=/")
-	};
+	let (secret, _) = issue(&app, &user, String::new(), TokenKind::Account, true, None).await?;
+	let cookie = session_cookie(&app, &secret, false);
 	Ok((
 		[(axum::http::header::SET_COOKIE, cookie)],
 		Json(LoginResponse { token: secret, user: user.into() }),
 	))
+}
+
+pub(super) async fn logout(
+	State(app): State<App>,
+	headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse> {
+	if let Ok(p) = authenticate(&app, &headers).await
+		&& p.token.session
+	{
+		let _ = app.db.delete_token_async(&p.token.owner, &p.token.hash).await;
+	}
+	let cookie = session_cookie(&app, "", true);
+	Ok((StatusCode::NO_CONTENT, [(axum::http::header::SET_COOKIE, cookie)]))
 }
 
 #[derive(Clone)]
@@ -274,6 +331,7 @@ pub(super) struct NewToken {
 	owner: Option<String>,
 	scope: Option<String>,
 	kind: Option<TokenKind>,
+	label: Option<String>,
 }
 
 pub(super) async fn create_token(
@@ -313,13 +371,28 @@ pub(super) async fn create_token(
 			return Err(bad("scope does not match token kind"));
 		}
 	}
-	let token = issue(&app, &user, scope, kind, false).await?;
+	let label = req.label.map(|l| l.trim().to_owned()).filter(|l| !l.is_empty());
+	if let Some(l) = &label
+		&& (l.len() > 128 || l.chars().any(char::is_control))
+	{
+		return Err(bad("invalid token label"));
+	}
+	let (token, record) = issue(&app, &user, scope, kind, false, label).await?;
 	let url = if kind == TokenKind::Account {
 		None
 	} else {
-		app.public_url.as_ref().map(|base| format!("{base}/t/{token}"))
+		app.public_url.as_ref().map(|base| format!("{}/t/{token}", base.trim_end_matches('/')))
 	};
-	Ok(Json(serde_json::json!({"token": token, "url": url})))
+	Ok(Json(serde_json::json!({
+		"token": token,
+		"hash": record.hash,
+		"owner": record.owner,
+		"kind": record.kind,
+		"scope": record.scope,
+		"created": record.created,
+		"label": record.label,
+		"url": url,
+	})))
 }
 
 pub(super) async fn list_tokens(

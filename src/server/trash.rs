@@ -1,7 +1,9 @@
 //! Trash, restore, retention, and recovery using each user's .flora file.
 
 use super::{
-	App, Result, auth, bad, conflict, db, files, forbidden, missing,
+	App, Result, auth, bad, conflict, db,
+	events::TreeOp,
+	files, forbidden, missing,
 	profile::{self, TrashEntry, TrashState},
 };
 use crate::core::{self, FileRecord, Upload, User};
@@ -90,6 +92,10 @@ pub(super) async fn list(
 	if !files::allowed(&principal, &owner, "", true) {
 		return Err(forbidden());
 	}
+	let user: Option<User> = app.db.get_async(&db::user(&owner)).await?;
+	let retention_str =
+		user.as_ref().and_then(|u| u.retention.as_deref()).unwrap_or(&app.trash_retention);
+	let retention_secs = core::duration(retention_str).ok().flatten();
 	let mut personal = profile::load(&app, &owner).await?;
 	if personal.trash.values().any(|entry| entry.state != TrashState::Ready) {
 		let _guard = app.user_locks.lock(&owner).await;
@@ -101,11 +107,17 @@ pub(super) async fn list(
 		.into_iter()
 		.filter(|(_, entry)| entry.state == TrashState::Ready)
 		.map(|(id, entry)| {
+			let directory = entry.records.len() != 1
+				|| entry.records.first().is_some_and(|r| r.path != entry.path);
+			let expires_at = retention_secs.map(|secs| entry.deleted.saturating_add(secs));
 			serde_json::json!({
 				"id": id,
+				"owner": owner,
 				"path": entry.path,
 				"deleted": entry.deleted,
+				"expires_at": expires_at,
 				"size": entry.size,
+				"directory": directory,
 			})
 		})
 		.collect();
@@ -170,6 +182,7 @@ pub(super) async fn restore(
 	personal.trash.get_mut(&id).ok_or_else(missing)?.state = TrashState::Restoring;
 	profile::save(&app, &owner, &personal).await?;
 	tokio::task::spawn_blocking(move || core::rename::no_replace(&stored, &original)).await??;
+	let restored_path = entry.path.clone();
 	let puts: Vec<(String, FileRecord)> =
 		entry.records.into_iter().map(|record| (db::file(&owner, &record.path), record)).collect();
 	app.db.write_batch_async(&puts, &[]).await?;
@@ -178,6 +191,31 @@ pub(super) async fn restore(
 	if tokio::fs::try_exists(&directory).await? {
 		tokio::fs::remove_dir_all(directory).await?;
 	}
+	app.events.emit_tree(&owner, TreeOp::Restore, vec![restored_path]);
+	Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn remove_one(
+	State(app): State<App>,
+	Path(id): Path<String>,
+	headers: HeaderMap,
+	Query(query): Query<TrashQuery>,
+) -> Result<StatusCode> {
+	let principal = auth::authenticate(&app, &headers).await?;
+	let owner = files::owner(&app, &principal, query.owner.as_deref()).await?;
+	if !files::allowed(&principal, &owner, "", true) {
+		return Err(forbidden());
+	}
+	let _guard = app.user_locks.lock(&owner).await;
+	recover_user(&app, &owner).await?;
+	let personal = profile::load(&app, &owner).await?;
+	let entry = personal.trash.get(&id).ok_or_else(missing)?;
+	if entry.state != TrashState::Ready {
+		return Err(conflict("trash item is being recovered"));
+	}
+	let purged_path = entry.path.clone();
+	purge_items(&app, &owner, std::slice::from_ref(&id)).await?;
+	app.events.emit_tree(&owner, TreeOp::Purge, vec![purged_path]);
 	Ok(StatusCode::NO_CONTENT)
 }
 

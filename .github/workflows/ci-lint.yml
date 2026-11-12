@@ -38,3 +38,24 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1'
+
+      - name: Install dependencies
+        run: bun install --cwd web --frozen-lockfile
+
+      - name: Check
+        run: bun run --cwd web check
+
+      - name: Build
+        run: bun run --cwd web build

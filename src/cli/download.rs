@@ -20,6 +20,14 @@ use xxhash_rust::xxh3::Xxh3;
 
 const RANGE_SIZE: u64 = 8_000_000;
 
+struct RangeSession {
+	id: String,
+	offset: u64,
+	remaining: u64,
+	size: u64,
+	etag: String,
+}
+
 struct Source {
 	http: reqwest::Client,
 	url: String,
@@ -66,24 +74,26 @@ impl Source {
 		&self,
 		start: u64,
 		end: u64,
-		size: u64,
-		etag: &str,
+		session: &RangeSession,
 	) -> Result<reqwest::Response> {
 		let response = checked(
 			send(
 				self.request()
 					.header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-					.header(reqwest::header::IF_RANGE, etag),
+					.header(reqwest::header::IF_RANGE, &session.etag)
+					.header("X-Transfer-Id", &session.id)
+					.header("X-Transfer-Offset", session.offset.to_string())
+					.header("X-Transfer-Total", session.remaining.to_string()),
 			)
 			.await?,
 		)
 		.await?;
-		let expected = format!("bytes {start}-{end}/{size}");
+		let expected = format!("bytes {start}-{end}/{}", session.size);
 		if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
 			|| response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok())
 				!= Some(expected.as_str())
 			|| response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok())
-				!= Some(etag)
+				!= Some(session.etag.as_str())
 		{
 			bail!("the server file changed or did not provide the requested range");
 		}
@@ -186,11 +196,19 @@ pub(super) async fn run(global: &GlobalOptions, down: &DownloadConfig) -> Result
 		}
 		blank(flags);
 		let mut file = open_partial(&partial, exists).await?;
-		let count = size.saturating_sub(offset).div_ceil(RANGE_SIZE);
+		let remaining = size.saturating_sub(offset);
+		let session = RangeSession {
+			id: uuid::Uuid::new_v4().to_string(),
+			offset,
+			remaining,
+			size,
+			etag: etag.to_owned(),
+		};
+		let count = remaining.div_ceil(RANGE_SIZE);
 		let requests = stream::iter((0..count).map(|number| {
 			let start = offset + number * RANGE_SIZE;
 			let end = start.saturating_add(RANGE_SIZE).min(size) - 1;
-			fetch_piece(&source, start, end, size, etag)
+			fetch_piece(&source, start, end, &session)
 		}))
 		.buffered(down.parallel);
 		tokio::pin!(requests);
@@ -319,10 +337,9 @@ async fn fetch_piece(
 	source: &Source,
 	start: u64,
 	end: u64,
-	size: u64,
-	etag: &str,
+	session: &RangeSession,
 ) -> Result<Vec<u8>> {
-	let mut response = source.range(start, end, size, etag).await?;
+	let mut response = source.range(start, end, session).await?;
 	let expected = usize::try_from(end - start + 1)?;
 	let mut piece = Vec::with_capacity(expected);
 	while let Some(chunk) = next_chunk(&mut response).await? {

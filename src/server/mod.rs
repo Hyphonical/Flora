@@ -2,7 +2,9 @@
 
 mod auth;
 mod db;
+mod events;
 mod files;
+mod git;
 mod install;
 mod ops;
 mod profile;
@@ -13,7 +15,7 @@ mod transfer_locks;
 mod trash;
 mod uploads;
 mod volume;
-
+mod web;
 use crate::core::{self, config::ServeConfig};
 use anyhow::bail;
 use axum::{
@@ -47,6 +49,8 @@ pub(crate) struct App {
 	pub setup_code: Arc<Mutex<Option<String>>>,
 	pub transfer_locks: Arc<transfer_locks::Registry>,
 	pub user_locks: Arc<transfer_locks::UserLocks>,
+	pub events: Arc<events::Hub>,
+	pub http: reqwest::Client,
 	pub accounts: Arc<Mutex<()>>,
 	pub reservation: Arc<Mutex<()>>,
 	pub chunk_permits: Arc<tokio::sync::Semaphore>,
@@ -142,6 +146,10 @@ pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
 	if let Some(code) = &setup_code {
 		tracing::info!(setup_code = %code, "first-run setup code generated");
 	}
+	let http = reqwest::Client::builder()
+		.connect_timeout(std::time::Duration::from_secs(15))
+		.timeout(std::time::Duration::from_secs(300))
+		.build()?;
 	let app = App {
 		db,
 		data,
@@ -160,6 +168,8 @@ pub(crate) async fn run(config: &ServeConfig) -> anyhow::Result<()> {
 		limits: Arc::new(Mutex::new(ops::Limits::default())),
 		transfer_locks: Arc::new(transfer_locks::Registry::default()),
 		user_locks: Arc::new(transfer_locks::UserLocks::default()),
+		events: Arc::new(events::Hub::default()),
+		http,
 		accounts: Arc::new(Mutex::new(())),
 		reservation: Arc::new(Mutex::new(())),
 		chunk_permits: Arc::new(tokio::sync::Semaphore::new(config.upload_concurrency)),
@@ -210,8 +220,11 @@ fn build_router(app: &App) -> Router {
 		.route("/install.sh", get(install::shell))
 		.route("/install.ps1", get(install::powershell))
 		.route("/api/client/{target}", get(install::binary))
+		.route("/info/refs", get(git::info_refs))
+		.route("/api/bootstrap", get(auth::bootstrap))
 		.route("/api/setup", post(auth::setup))
 		.route("/api/login", post(auth::login))
+		.route("/api/logout", post(auth::logout))
 		.route("/api/me", get(auth::me))
 		.route("/api/tokens", get(auth::list_tokens).post(auth::create_token))
 		.route("/api/tokens/{hash}", axum::routing::delete(auth::revoke_token))
@@ -220,6 +233,8 @@ fn build_router(app: &App) -> Router {
 		.route("/api/uploads", post(uploads::create))
 		.route("/api/uploads/{id}", get(uploads::status).delete(uploads::cancel))
 		.route("/api/uploads/{id}/complete", post(uploads::complete))
+		.route("/api/transfers", get(events::list_transfers))
+		.route("/api/events", get(events::sse))
 		.route(
 			"/api/files",
 			get(files::list)
@@ -227,9 +242,13 @@ fn build_router(app: &App) -> Router {
 				.delete(files::remove)
 				.patch(files::move_file),
 		)
+		.route("/api/pastes", get(files::pastes))
 		.route("/api/trash", get(trash::list))
+		.route("/api/trash/{id}", axum::routing::delete(trash::remove_one))
 		.route("/api/trash/{id}/restore", post(trash::restore))
 		.route("/api/download", get(files::download))
+		.route("/api/share/{token}", get(files::share_info_root))
+		.route("/api/share/{token}/{*path}", get(files::share_info_path))
 		.route("/t/{token}", get(files::shared_file))
 		.route("/t/{token}/{*path}", get(files::shared_path))
 		.route("/api/dashboard", get(ops::dashboard))
@@ -239,13 +258,19 @@ fn build_router(app: &App) -> Router {
 		.route("/api/purge", post(ops::purge))
 		.layer(DefaultBodyLimit::max(1024 * 1024));
 
+	let git_routes = Router::new()
+		.route("/git-upload-pack", post(git::upload_pack))
+		.layer(DefaultBodyLimit::max(4 * 1024 * 1024));
+
 	let stream_routes = Router::new()
 		.route("/api/upload", put(simple_upload::upload))
 		.route("/api/uploads/{id}/{number}", put(uploads::chunk))
 		.layer(DefaultBodyLimit::disable());
 
 	json_routes
+		.merge(git_routes)
 		.merge(stream_routes)
+		.fallback(web::spa_or_asset)
 		.layer(axum::middleware::from_fn_with_state(app.clone(), ops::guard))
 		.with_state(app.clone())
 }
@@ -301,6 +326,8 @@ mod tests {
 			limits: Arc::new(Mutex::new(ops::Limits::default())),
 			transfer_locks: Arc::new(transfer_locks::Registry::default()),
 			user_locks: Arc::new(transfer_locks::UserLocks::default()),
+			events: Arc::new(events::Hub::default()),
+			http: reqwest::Client::new(),
 			accounts: Arc::new(Mutex::new(())),
 			reservation: Arc::new(Mutex::new(())),
 			chunk_permits: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -499,14 +526,16 @@ mod tests {
 		assert_eq!(purge_resp.status(), StatusCode::OK);
 		assert!(!cached_webp.exists(), "purging file should evict its cached WebP thumbnail");
 
-		// Windows .exe asset lookup works for /api/client/windows-x86_64.
-		let assets_dir = app.data.join("assets");
-		std::fs::create_dir_all(&assets_dir).unwrap();
-		std::fs::write(assets_dir.join("flora-windows-x86_64.exe"), b"MZ-flora-stub").unwrap();
-		let win_bin = http.get(format!("{base}/api/client/windows-x86_64")).send().await.unwrap();
-		assert_eq!(win_bin.status(), StatusCode::OK);
-		assert_eq!(win_bin.bytes().await.unwrap().as_ref(), b"MZ-flora-stub");
-
+		// /api/client/windows-x86_64 redirects to the latest GitHub Release binary.
+		let no_redirect =
+			reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+		let win_bin =
+			no_redirect.get(format!("{base}/api/client/windows-x86_64")).send().await.unwrap();
+		assert_eq!(win_bin.status(), StatusCode::FOUND);
+		assert_eq!(
+			win_bin.headers().get(axum::http::header::LOCATION).unwrap(),
+			"https://github.com/Hyphonical/Flora/releases/latest/download/flora-windows-x86_64.exe"
+		);
 		// Rebuild recovers user & live files from storage/.flora when Fjall is recreated.
 		let fresh_db_dir = ws.root.join("rebuilt-fjall");
 		let rebuilt_app = App { db: db::Store::open(&fresh_db_dir).unwrap(), ..app.clone() };
@@ -517,5 +546,215 @@ mod tests {
 		let recovered_file: Option<core::FileRecord> =
 			rebuilt_app.db.get(&db::file(&user_id, "docs/blob.bin")).unwrap();
 		assert_eq!(recovered_file.expect("recovered file").hash, expected_hash);
+	}
+
+	#[tokio::test]
+	async fn bootstrap_sse_transfers_shares_pastes_and_single_trash_delete() {
+		let ws = TempWorkspace::new();
+		let (base, setup_code, _app) = spawn_test_server(&ws).await;
+		let http = reqwest::Client::new();
+
+		let boot_pre: serde_json::Value =
+			http.get(format!("{base}/api/bootstrap")).send().await.unwrap().json().await.unwrap();
+		assert_eq!(boot_pre["setup_required"], true);
+		assert!(boot_pre["user"].is_null());
+
+		let setup_resp = http
+			.post(format!("{base}/api/setup"))
+			.json(&json!({"code": setup_code, "name": "alice", "password": "correct-horse"}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(setup_resp.status(), StatusCode::OK);
+		let set_cookie = setup_resp
+			.headers()
+			.get(axum::http::header::SET_COOKIE)
+			.unwrap()
+			.to_str()
+			.unwrap()
+			.split(';')
+			.next()
+			.unwrap()
+			.to_owned();
+		let setup_json: serde_json::Value = setup_resp.json().await.unwrap();
+		let token = setup_json["token"].as_str().unwrap().to_owned();
+
+		// Cookie-authenticated bootstrap & SSE stream.
+		let boot_post: serde_json::Value = http
+			.get(format!("{base}/api/bootstrap"))
+			.header(axum::http::header::COOKIE, &set_cookie)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(boot_post["setup_required"], false);
+		assert_eq!(boot_post["user"]["name"], "alice");
+
+		let mut sse_resp = http
+			.get(format!("{base}/api/events"))
+			.header(axum::http::header::COOKIE, &set_cookie)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(sse_resp.status(), StatusCode::OK);
+		let ready_chunk = sse_resp.chunk().await.unwrap().unwrap();
+		assert!(std::str::from_utf8(&ready_chunk).unwrap().contains("event: ready"));
+
+		// Upload a markdown paste from CLI user-agent and observe SSE events.
+		let note_body = b"# Flora Notes\nHello SSE!\n";
+		let put_note = http
+			.put(format!("{base}/api/upload?path=notes/todo.md"))
+			.bearer_auth(&token)
+			.header(axum::http::header::USER_AGENT, "Flora/0.1.0")
+			.header(axum::http::header::CONTENT_LENGTH, note_body.len())
+			.body(note_body.to_vec())
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(put_note.status(), StatusCode::OK);
+
+		// Mint a file share token and verify single-pass folder stats + shared_token + pastes.
+		let share_created: serde_json::Value = http
+			.post(format!("{base}/api/tokens"))
+			.bearer_auth(&token)
+			.json(&json!({"scope": "notes/todo.md", "label": "team link"}))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let share_secret = share_created["token"].as_str().unwrap().to_owned();
+
+		let root_entries: Vec<core::Entry> = http
+			.get(format!("{base}/api/files"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(root_entries.len(), 1);
+		assert_eq!(root_entries[0].name, "notes");
+		assert_eq!(root_entries[0].size, note_body.len() as u64);
+		assert_eq!(root_entries[0].item_count, Some(1));
+
+		let pastes: Vec<core::Entry> = http
+			.get(format!("{base}/api/pastes"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(pastes.len(), 1);
+		assert_eq!(pastes[0].shared_token.as_deref(), Some(share_secret.as_str()));
+
+		// Share link serves HTML shell to browsers, JSON metadata on /api/share, and raw bytes to CLI.
+		let html_share = http
+			.get(format!("{base}/t/{share_secret}"))
+			.header(axum::http::header::ACCEPT, "text/html,application/xhtml+xml")
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(html_share.status(), StatusCode::OK);
+		assert!(
+			html_share
+				.headers()
+				.get(axum::http::header::CONTENT_TYPE)
+				.unwrap()
+				.to_str()
+				.unwrap()
+				.starts_with("text/html")
+		);
+
+		let share_meta: serde_json::Value = http
+			.get(format!("{base}/api/share/{share_secret}"))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(share_meta["kind"], "file");
+		assert_eq!(share_meta["entry"]["name"], "todo.md");
+
+		let raw_share = http
+			.get(format!("{base}/t/{share_secret}?download=1"))
+			.header("X-Transfer-Id", "11111111-1111-4111-8111-111111111111")
+			.send()
+			.await
+			.unwrap();
+		assert!(
+			raw_share
+				.headers()
+				.get(axum::http::header::CONTENT_DISPOSITION)
+				.unwrap()
+				.to_str()
+				.unwrap()
+				.starts_with("attachment;")
+		);
+		assert_eq!(raw_share.bytes().await.unwrap().as_ref(), note_body);
+
+		// Read buffered SSE frames and confirm both upload and download lifecycle events arrived.
+		let mut sse_buf = String::new();
+		while sse_buf.matches("transfer:completed").count() < 2 {
+			let next = tokio::time::timeout(std::time::Duration::from_secs(2), sse_resp.chunk())
+				.await
+				.unwrap()
+				.unwrap()
+				.unwrap();
+			sse_buf.push_str(std::str::from_utf8(&next).unwrap());
+		}
+		assert!(sse_buf.contains("\"source\":\"cli\""));
+		assert!(sse_buf.contains("\"direction\":\"upload\""));
+		assert!(sse_buf.contains("\"direction\":\"download\""));
+
+		// Trash & single-item permanent delete (`DELETE /api/trash/{id}`).
+		let rm = http
+			.delete(format!("{base}/api/files?path=notes/todo.md"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(rm.status(), StatusCode::NO_CONTENT);
+		let trash_list: Vec<serde_json::Value> = http
+			.get(format!("{base}/api/trash"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(trash_list.len(), 1);
+		let trash_id = trash_list[0]["id"].as_str().unwrap();
+		let del_one = http
+			.delete(format!("{base}/api/trash/{trash_id}"))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(del_one.status(), StatusCode::NO_CONTENT);
+
+		// Logout invalidates the session cookie token.
+		let logout = http
+			.post(format!("{base}/api/logout"))
+			.header(axum::http::header::COOKIE, &set_cookie)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+		let after_logout = http
+			.get(format!("{base}/api/me"))
+			.header(axum::http::header::COOKIE, &set_cookie)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(after_logout.status(), StatusCode::UNAUTHORIZED);
 	}
 }

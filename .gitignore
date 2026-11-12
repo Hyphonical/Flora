@@ -1,8 +1,11 @@
 /.omp/
 /.mockup/
+/.test/
 /target/
 /PLAN.md
 /dist/
+/web/dist/
+/web/node_modules/
 /data/
 /buffer/
 /storage/

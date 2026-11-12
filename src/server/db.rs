@@ -1,6 +1,6 @@
 //! Fjall-backed typed metadata records, secondary indexes, and non-blocking durable mutations.
 
-use crate::core::{Token, User};
+use crate::core::{FileRecord, Token, TokenKind, User};
 use anyhow::Result;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use serde::{Serialize, de::DeserializeOwned};
@@ -309,6 +309,45 @@ impl Store {
 			Ok(())
 		})
 		.await?
+	}
+
+	pub(crate) async fn sum_file_sizes_async(&self, owner: &str) -> Result<u64> {
+		let store = self.clone();
+		let prefix = files(owner);
+		tokio::task::spawn_blocking(move || -> Result<u64> {
+			let mut sum = 0u64;
+			for guard in store.records.prefix(&prefix) {
+				let value = guard.value()?;
+				let record: FileRecord = serde_json::from_slice(&value)?;
+				sum = sum.saturating_add(record.size);
+			}
+			Ok(sum)
+		})
+		.await?
+	}
+
+	pub(crate) fn share_map_sync(
+		&self,
+		owner: &str,
+	) -> Result<std::collections::HashMap<String, String>> {
+		let prefix = format!("user_token/{owner}/");
+		let mut map = std::collections::HashMap::new();
+		for guard in self.records.prefix(&prefix) {
+			let key_bytes = guard.key()?;
+			let Ok(key_str) = std::str::from_utf8(&key_bytes) else {
+				continue;
+			};
+			let Some(hash) = key_str.strip_prefix(&prefix) else {
+				continue;
+			};
+			if let Some(tok) = self.get::<Token>(&token(hash))?
+				&& matches!(tok.kind, TokenKind::File | TokenKind::Folder)
+				&& let Some(secret) = tok.secret
+			{
+				map.insert(tok.scope, secret);
+			}
+		}
+		Ok(map)
 	}
 }
 

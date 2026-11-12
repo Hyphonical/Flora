@@ -49,6 +49,15 @@ impl fmt::Display for TokenKind {
 	}
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TransferSource {
+	#[default]
+	Web,
+	Cli,
+	Share,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Token {
 	pub hash: String,
@@ -57,6 +66,12 @@ pub(crate) struct Token {
 	#[serde(default)]
 	pub kind: TokenKind,
 	pub session: bool,
+	#[serde(default)]
+	pub created: u64,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub label: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub secret: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,11 +182,15 @@ pub(crate) struct Upload {
 	pub path: String,
 	#[serde(default)]
 	pub requested_path: String,
+	#[serde(default)]
+	pub source: TransferSource,
 	pub size: Option<u64>,
 	pub reserved: u64,
 	pub chunk_size: u64,
 	pub chunks: Vec<Option<Chunk>>,
 	pub conflict: ConflictPolicy,
+	#[serde(default)]
+	pub created: u64,
 	pub updated: u64,
 	pub copying: bool,
 	#[serde(default)]
@@ -198,7 +217,8 @@ pub(crate) struct UploadRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CompleteRequest {
-	pub hash: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub hash: Option<String>,
 	pub size: u64,
 }
 
@@ -210,6 +230,10 @@ pub(crate) struct Entry {
 	pub size: u64,
 	pub modified: u64,
 	pub hash: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub item_count: Option<u64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub shared_token: Option<String>,
 }
 
 pub(crate) fn now() -> u64 {
@@ -344,6 +368,37 @@ pub(crate) fn scoped(scope: &str, path: &str) -> bool {
 	scope.is_empty()
 		|| path == scope
 		|| path.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))
+}
+
+pub(crate) fn query_flag<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	struct Visitor;
+	impl serde::de::Visitor<'_> for Visitor {
+		type Value = bool;
+		fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+			f.write_str("a boolean or 1/0/true/false")
+		}
+		fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<bool, E> {
+			Ok(v)
+		}
+		fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<bool, E> {
+			match v {
+				0 => Ok(false),
+				1 => Ok(true),
+				_ => Err(E::custom("expected 0 or 1")),
+			}
+		}
+		fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<bool, E> {
+			match v.trim().to_ascii_lowercase().as_str() {
+				"1" | "true" | "yes" => Ok(true),
+				"" | "0" | "false" | "no" => Ok(false),
+				_ => Err(E::custom("expected 1, 0, true, or false")),
+			}
+		}
+	}
+	deserializer.deserialize_any(Visitor)
 }
 
 #[cfg(test)]

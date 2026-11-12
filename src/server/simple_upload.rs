@@ -1,6 +1,6 @@
 //! Stream a single-request upload directly to storage staging without intermediate chunk files.
 
-use super::{App, Result, auth, bad, uploads};
+use super::{App, Result, auth, bad, events, uploads};
 use crate::core::{self, ConflictPolicy, FileRecord, UploadRequest};
 use axum::{
 	Json,
@@ -26,6 +26,7 @@ pub(super) async fn upload(
 	body: Body,
 ) -> Result<Json<FileRecord>> {
 	let principal = auth::authenticate(&app, &headers).await?;
+	let source = events::detect_source(&headers, false);
 	let size = headers
 		.get(header::CONTENT_LENGTH)
 		.map(|value| {
@@ -50,6 +51,7 @@ pub(super) async fn upload(
 		&app,
 		&principal,
 		UploadRequest { path: query.path, owner: query.owner, size, conflict: query.conflict },
+		source,
 		false,
 	)
 	.await?;

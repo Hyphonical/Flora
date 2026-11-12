@@ -1,7 +1,9 @@
 //! Buffer reservations, resumable chunk uploads, verification, and crash recovery.
 
-use super::{App, Result, auth, bad, conflict, db, files, forbidden, missing, trash};
-use crate::core::{self, Chunk, CompleteRequest, FileRecord, Upload, UploadRequest};
+use super::{App, Result, auth, bad, conflict, db, events, files, forbidden, missing, trash};
+use crate::core::{
+	self, Chunk, CompleteRequest, FileRecord, TransferSource, Upload, UploadRequest,
+};
 use axum::{
 	Json,
 	body::Body,
@@ -144,13 +146,15 @@ pub(super) async fn create(
 	Json(req): Json<UploadRequest>,
 ) -> Result<Json<Upload>> {
 	let p = auth::authenticate(&app, &headers).await?;
-	Ok(Json(begin_upload(&app, &p, req, true).await?))
+	let source = events::detect_source(&headers, false);
+	Ok(Json(begin_upload(&app, &p, req, source, true).await?))
 }
 
 pub(super) async fn begin_upload(
 	app: &App,
 	p: &auth::Principal,
 	req: UploadRequest,
+	source: TransferSource,
 	allow_resume: bool,
 ) -> Result<Upload> {
 	let owner = files::owner(app, p, req.owner.as_deref()).await?;
@@ -190,7 +194,14 @@ pub(super) async fn begin_upload(
 			return Err(conflict("file already exists"));
 		}
 		tracing::debug!(upload = %existing.id, "resuming buffered upload");
-		return Ok(existing.clone());
+		let mut resumed = existing.clone();
+		if resumed.source != source {
+			resumed.source = source;
+			resumed.updated = core::now();
+			app.db.put_async(&db::upload(&resumed.id), &resumed).await?;
+		}
+		app.events.upload_started(&resumed, true);
+		return Ok(resumed);
 	}
 	let root = app.storage.join(&owner);
 	let mut exists = app.db.get_async::<FileRecord>(&db::file(&owner, &path)).await?.is_some();
@@ -245,17 +256,20 @@ pub(super) async fn begin_upload(
 	let reserved = req.size.unwrap_or(0);
 	available(app, &existing_uploads, reserved).await?;
 	reserve_quota(app, &user, &existing_uploads, reserved).await?;
+	let now = core::now();
 	let upload = Upload {
 		id: Uuid::new_v4().to_string(),
 		owner,
 		path,
 		requested_path,
+		source,
 		size: req.size,
 		reserved,
 		chunk_size: app.chunk_size,
 		chunks: Vec::new(),
 		conflict: req.conflict,
-		updated: core::now(),
+		created: now,
+		updated: now,
 		copying: false,
 		final_hash: None,
 	};
@@ -263,6 +277,7 @@ pub(super) async fn begin_upload(
 		tokio::fs::create_dir_all(app.buffer.join(&upload.owner).join(&upload.id)).await?;
 	}
 	app.db.put_async(&db::upload(&upload.id), &upload).await?;
+	app.events.upload_started(&upload, allow_resume);
 	tracing::debug!(upload = %upload.id, reserved = upload.reserved, "upload reserved");
 	Ok(upload)
 }
@@ -388,12 +403,14 @@ where
 		.ok_or_else(|| conflict("upload was cancelled"))?
 	{
 		let bytes = next.map_err(|e| bad(format!("reading chunk: {e}")))?;
-		size = size.checked_add(bytes.len() as u64).ok_or_else(|| bad("chunk too large"))?;
+		let chunk_delta = bytes.len() as u64;
+		size = size.checked_add(chunk_delta).ok_or_else(|| bad("chunk too large"))?;
 		if size > declared {
 			return Err(bad("chunk exceeds declared length"));
 		}
 		hash.update(&bytes);
 		file.write_all(&bytes).await?;
+		app.events.upload_chunk_inflight(&initial, number, size, chunk_delta);
 	}
 	if size != declared {
 		return Err(bad("chunk is shorter than declared"));
@@ -413,6 +430,7 @@ where
 	upload.chunks[number] = Some(result.clone());
 	upload.updated = core::now();
 	app.db.put_async(&db::upload(&upload.id), &upload).await?;
+	app.events.upload_chunk_done(&upload, number);
 	tracing::debug!(upload = %id, chunk = number, bytes = size, "chunk received");
 	Ok(result)
 }
@@ -434,9 +452,11 @@ pub(super) async fn complete_upload(
 	id: &str,
 	req: CompleteRequest,
 ) -> Result<FileRecord> {
-	if !core::hex::is_hex_128(&req.hash) {
-		return Err(bad("invalid XXH3-128 hash"));
-	}
+	let expected_hash = match &req.hash {
+		Some(h) if core::hex::is_hex_128(h) => Some(h.to_ascii_lowercase()),
+		Some(_) => return Err(bad("invalid XXH3-128 hash")),
+		None => None,
+	};
 	let initial: Upload = app.db.get_async(&db::upload(id)).await?.ok_or_else(missing)?;
 	ensure_access(p, &initial)?;
 	let locks = app.transfer_locks.get(id);
@@ -487,21 +507,30 @@ pub(super) async fn complete_upload(
 		}
 	}
 	tracing::debug!(upload = %id, chunks = count, "assembling and verifying upload");
+	app.events.upload_phase(&upload, events::TransferPhase::Verifying);
 	let staging = staging_path(app, &upload.id);
-	let normalized_hash = req.hash.to_ascii_lowercase();
-	assemble_and_verify_chunks(app, &upload, count, &staging, &normalized_hash, &locks.cancel)
-		.await?;
+	let computed_hash = assemble_and_verify_chunks(
+		app,
+		&upload,
+		count,
+		&staging,
+		expected_hash.as_deref(),
+		&locks.cancel,
+	)
+	.await?;
 	if locks.cancel.is_cancelled() {
 		let _ = tokio::fs::remove_file(&staging).await;
 		return Err(conflict("upload was cancelled"));
 	}
 	upload.copying = true;
-	upload.final_hash = Some(normalized_hash.clone());
+	upload.final_hash = Some(computed_hash.clone());
 	upload.size = Some(req.size);
 	upload.updated = core::now();
 	app.db.put_async(&db::upload(&upload.id), &upload).await?;
-	let record = commit_staged(app, &upload, normalized_hash, req.size, &locks.cancel).await?;
+	app.events.upload_phase(&upload, events::TransferPhase::Storing);
+	let record = commit_staged(app, &upload, computed_hash, req.size, &locks.cancel).await?;
 	app.transfer_locks.remove(id);
+	app.events.upload_completed(&upload, &record);
 	tracing::debug!(upload = %id, "upload stored");
 	Ok(record)
 }
@@ -529,7 +558,8 @@ pub(super) async fn stream_direct_upload(
 		.ok_or_else(|| conflict("upload was cancelled"))?
 	{
 		let data = next.map_err(|error| bad(format!("reading upload: {error}")))?;
-		total = total.checked_add(data.len() as u64).ok_or_else(|| bad("upload too large"))?;
+		let delta = data.len() as u64;
+		total = total.checked_add(delta).ok_or_else(|| bad("upload too large"))?;
 		if total > app.buffer_size {
 			return Err(bad(format!(
 				"file is larger than buffer (FLORA_BUFFER_SIZE): {} bytes",
@@ -556,6 +586,7 @@ pub(super) async fn stream_direct_upload(
 		}
 		hash.update(&data);
 		output.write_all(&data).await?;
+		app.events.upload_stream_progress(upload, total, delta);
 	}
 	if expected_size.is_some_and(|expected| total != expected) {
 		return Err(bad("upload is shorter than Content-Length"));
@@ -575,8 +606,10 @@ pub(super) async fn stream_direct_upload(
 	upload.final_hash = Some(digest.clone());
 	upload.updated = core::now();
 	app.db.put_async(&db::upload(&upload.id), upload).await?;
+	app.events.upload_phase(upload, events::TransferPhase::Storing);
 	let record = commit_staged(app, upload, digest, total, &locks.cancel).await?;
 	app.transfer_locks.remove(&upload.id);
+	app.events.upload_completed(upload, &record);
 	Ok(record)
 }
 
@@ -585,13 +618,13 @@ async fn assemble_and_verify_chunks(
 	upload: &Upload,
 	count: usize,
 	staging: &std::path::Path,
-	expected_hash: &str,
+	expected_hash: Option<&str>,
 	cancel: &tokio_util::sync::CancellationToken,
-) -> Result<()> {
+) -> Result<String> {
 	let mut output = tokio::fs::File::create(staging).await?;
 	let mut hash = Xxh3::new();
 	let mut buf = vec![0u8; 64 * 1024];
-	let write_res: Result<()> = async {
+	let write_res: Result<String> = async {
 		for i in 0..count {
 			let mut file = tokio::fs::File::open(chunk_path(app, upload, i)).await?;
 			loop {
@@ -606,11 +639,12 @@ async fn assemble_and_verify_chunks(
 				output.write_all(&buf[..n]).await?;
 			}
 		}
-		if core::hex::u128(hash.digest128()) != expected_hash {
+		let digest = core::hex::u128(hash.digest128());
+		if expected_hash.is_some_and(|expected| digest != expected) {
 			return Err(bad("XXH3-128 checksum mismatch"));
 		}
 		output.sync_all().await?;
-		Ok(())
+		Ok(digest)
 	}
 	.await;
 	drop(output);
@@ -686,6 +720,7 @@ pub(super) async fn cancel(
 pub(super) async fn cancel_upload(app: &App, p: &auth::Principal, id: &str) -> Result<()> {
 	let upload: Upload = app.db.get_async(&db::upload(id)).await?.ok_or_else(missing)?;
 	ensure_access(p, &upload)?;
+	let owner = upload.owner.clone();
 	let locks = app.transfer_locks.get(id);
 	locks.cancel.cancel();
 	let _upload_guard = locks.gate.write().await;
@@ -695,6 +730,7 @@ pub(super) async fn cancel_upload(app: &App, p: &auth::Principal, id: &str) -> R
 		remove_upload_artifacts(app, &upload.owner, id).await?;
 	}
 	app.transfer_locks.remove(id);
+	app.events.upload_cancelled(&owner, id);
 	Ok(())
 }
 
@@ -737,8 +773,15 @@ pub(super) async fn recover(app: &App) -> anyhow::Result<()> {
 						&& core::hex::hash_file_async(&staging).await.is_ok_and(|h| h == hash);
 				if !staged_valid {
 					let count = size.div_ceil(upload.chunk_size) as usize;
-					assemble_and_verify_chunks(app, &upload, count, &staging, &hash, &locks.cancel)
-						.await?;
+					assemble_and_verify_chunks(
+						app,
+						&upload,
+						count,
+						&staging,
+						Some(&hash),
+						&locks.cancel,
+					)
+					.await?;
 				}
 			}
 			commit_staged(app, &upload, hash, size, &locks.cancel).await

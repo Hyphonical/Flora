@@ -83,7 +83,7 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Download Web Assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist
@@ -113,7 +113,7 @@ jobs:
       contents: write
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

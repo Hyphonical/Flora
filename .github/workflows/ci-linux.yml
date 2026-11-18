@@ -60,7 +60,7 @@ jobs:
           [ -f README.md ] && cp README.md dist/ || true
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flora-linux-${{ matrix.arch }}
           path: dist/*
